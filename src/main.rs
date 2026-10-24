@@ -15,7 +15,7 @@ use ureq::{Agent, SendBody, http::Response};
 #[derive(Parser)]
 #[command(version, about = "Share files and text through MediaLinker with short codes")]
 struct Cli {
-    /// MediaLinker server, e.g. https://media.example.com (overrides ML_SERVER and `ml server`)
+    /// MediaLinker server (overrides ML_SERVER and `ml server`; default https://medialinker.noecore.com)
     #[arg(long, short, global = true, value_name = "URL")]
     server: Option<String>,
     #[command(subcommand)]
@@ -135,12 +135,12 @@ fn normalize_server(url: &str) -> Result<String> {
     }
 }
 
+const DEFAULT_SERVER: &str = "https://medialinker.noecore.com";
+
 fn server(flag: Option<String>) -> Result<String> {
     let saved = || config_path().and_then(|p| fs::read_to_string(p).ok());
-    match flag.or_else(|| env::var("ML_SERVER").ok()).or_else(saved) {
-        Some(url) => normalize_server(&url),
-        None => Err("no server set: run `ml server https://your-medialinker` or set ML_SERVER".into()),
-    }
+    let url = flag.or_else(|| env::var("ML_SERVER").ok()).or_else(saved);
+    normalize_server(url.as_deref().unwrap_or(DEFAULT_SERVER))
 }
 
 fn save_server(url: &str) -> Result<()> {
