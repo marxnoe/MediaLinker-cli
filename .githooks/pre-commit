@@ -1,0 +1,12 @@
+#!/usr/bin/env bash
+# Enforce the AGENTS.md workflow: commits only on issue branches.
+branch=$(git symbolic-ref --short HEAD 2>/dev/null)
+case "$branch" in
+  main|master)
+    echo "pre-commit: no direct commits on '$branch'. Open an issue and use 'gh issue develop <n> --checkout'." >&2
+    exit 1 ;;
+esac
+if [ -n "$branch" ] && ! grep -Eq '(^|/)(issue-)?[0-9]+-' <<<"$branch"; then
+  echo "pre-commit: branch '$branch' has no issue number in its name (e.g. 12-fix-login)." >&2
+  exit 1
+fi
