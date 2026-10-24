@@ -1,0 +1,33 @@
+[package]
+name = "medialinker-cli"
+version = "0.1.0"
+edition = "2024"
+description = "Share files and text through MediaLinker with 5-character codes"
+repository = "https://github.com/marxnoe/MediaLinker-cli"
+homepage = "https://github.com/marxnoe/MediaLinker-cli"
+publish = false
+
+[[bin]]
+name = "ml"
+path = "src/main.rs"
+
+[package.metadata.dist]
+# publish = false keeps it off crates.io; this still lets dist build releases.
+dist = true
+
+[dependencies]
+clap = { version = "4.6.7", features = ["derive"] }
+dirs = "7.0.0"
+serde = { version = "1.0.229", features = ["derive"] }
+serde_json = "1.0.154"
+ureq = { version = "3.5.0", features = ["json"] }
+
+[profile.release]
+lto = true
+codegen-units = 1
+strip = true
+
+# The profile that 'dist' will build with
+[profile.dist]
+inherits = "release"
+lto = "thin"
