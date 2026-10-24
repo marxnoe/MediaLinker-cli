@@ -1,0 +1,9 @@
+#!/usr/bin/env bash
+# Enforce the AGENTS.md workflow: main only changes through merged PRs.
+while read -r _ _ remote_ref _; do
+  case "$remote_ref" in
+    refs/heads/main|refs/heads/master)
+      echo "pre-push: no direct pushes to ${remote_ref#refs/heads/}. Merge through a pull request." >&2
+      exit 1 ;;
+  esac
+done
