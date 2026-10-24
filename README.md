@@ -20,9 +20,9 @@ powershell -ExecutionPolicy Bypass -c "irm https://github.com/marxnoe/MediaLinke
 Prebuilt archives for Linux (x86_64, ARM64), macOS (Intel, Apple Silicon) and Windows are on the
 [releases page](https://github.com/marxnoe/MediaLinker-cli/releases).
 
-## Setup
+## Server
 
-Point `ml` at your server once:
+`ml` talks to https://medialinker.noecore.com by default. To use another MediaLinker server, save it once:
 
 ```sh
 ml server https://media.example.com

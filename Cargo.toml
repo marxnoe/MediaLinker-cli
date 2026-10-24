@@ -1,6 +1,6 @@
 [package]
 name = "medialinker-cli"
-version = "0.1.0"
+version = "0.2.0"
 edition = "2024"
 description = "Share files and text through MediaLinker with 5-character codes"
 repository = "https://github.com/marxnoe/MediaLinker-cli"
