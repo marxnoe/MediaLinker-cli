@@ -8,7 +8,9 @@ use std::{
     process::ExitCode,
 };
 
-use clap::{Parser, Subcommand, ValueEnum};
+use clap::{CommandFactory, Parser, Subcommand, ValueEnum};
+use clap_complete::Shell;
+use qrcode::{QrCode, render::unicode::Dense1x2};
 use serde::Deserialize;
 use ureq::{Agent, SendBody, http::Response};
 
@@ -37,6 +39,9 @@ enum Command {
         /// How long the share lives
         #[arg(long, value_enum, default_value_t = Ttl::Day)]
         ttl: Ttl,
+        /// Don't print a QR code for the receive page
+        #[arg(long)]
+        no_qr: bool,
     },
     /// Fetch a share: print text, or download a file into the current directory
     Get {
@@ -50,6 +55,8 @@ enum Command {
     },
     /// Show the saved server, or save a new one
     Server { url: Option<String> },
+    /// Print a shell completion script, e.g. `ml completions zsh > ~/.zfunc/_ml`
+    Completions { shell: Shell },
 }
 
 #[derive(Clone, Copy, ValueEnum)]
@@ -114,8 +121,18 @@ fn run(cli: Cli) -> Result<()> {
             Ok(())
         }
         Command::Server { url: Some(url) } => save_server(&url),
-        Command::Send { input, text, name, ttl } => send(&server(cli.server)?, input, text, name, ttl),
+        Command::Send {
+            input,
+            text,
+            name,
+            ttl,
+            no_qr,
+        } => send(&server(cli.server)?, input, text, name, ttl, !no_qr),
         Command::Get { code, output, force } => get(&server(cli.server)?, &code, output, force),
+        Command::Completions { shell } => {
+            clap_complete::generate(shell, &mut Cli::command(), "ml", &mut io::stdout());
+            Ok(())
+        }
     }
 }
 
@@ -232,7 +249,7 @@ fn quote(name: &str) -> String {
         .collect()
 }
 
-fn send(server: &str, input: Vec<String>, text: bool, name: Option<String>, ttl: Ttl) -> Result<()> {
+fn send(server: &str, input: Vec<String>, text: bool, name: Option<String>, ttl: Ttl, qr: bool) -> Result<()> {
     let boundary = format!("ml-{:016x}{:016x}", rand_u64(), rand_u64());
     let (head, body): (String, Box<dyn Read>) = match payload(input, text, name)? {
         Payload::Text(t) => {
@@ -268,9 +285,24 @@ fn send(server: &str, input: Vec<String>, text: bool, name: Option<String>, ttl:
         .map_err(|e| format!("unexpected answer from server: {e}"))?;
     println!("{}", created.code);
     if io::stderr().is_terminal() {
+        let link = format!("{server}/?code={}", created.code);
+        if qr && let Some(code) = qr_code(&link) {
+            eprint!("{code}");
+        }
+        eprintln!("Open {link}");
         eprintln!("Expires in {} ({})", ttl.as_str(), expiry(created.expires_at));
     }
     Ok(())
+}
+
+/// Renders `link` as a QR code in half-block characters, dark on light so it scans on any terminal theme.
+fn qr_code(link: &str) -> Option<String> {
+    let code = QrCode::new(link).ok()?;
+    let art = code.render::<Dense1x2>().quiet_zone(true).build();
+    if env::var_os("NO_COLOR").is_some() {
+        return Some(format!("{art}\n"));
+    }
+    Some(art.lines().map(|l| format!("\x1b[30;107m{l}\x1b[0m\n")).collect())
 }
 
 fn get(server: &str, code: &str, output: Option<PathBuf>, force: bool) -> Result<()> {
@@ -423,6 +455,22 @@ mod tests {
         assert_eq!(safe_name(Some("..")), "file");
         assert_eq!(safe_name(Some(".bashrc")), "bashrc");
         assert_eq!(safe_name(None), "file");
+    }
+
+    #[test]
+    fn links_become_qr_codes() {
+        let art = qr_code("https://medialinker.noecore.com/?code=K7QX2").unwrap();
+        assert!(art.lines().count() > 10);
+    }
+
+    #[test]
+    fn completions_cover_every_subcommand() {
+        let mut out = Vec::new();
+        clap_complete::generate(Shell::Bash, &mut Cli::command(), "ml", &mut out);
+        let script = String::from_utf8(out).unwrap();
+        for sub in ["send", "get", "server", "completions"] {
+            assert!(script.contains(sub), "{sub} missing");
+        }
     }
 
     #[test]
