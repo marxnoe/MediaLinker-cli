@@ -1,19 +1,29 @@
 [package]
 name = "medialinker-cli"
-version = "0.2.0"
+version = "0.3.0"
 edition = "2024"
 description = "Share files and text through MediaLinker with 5-character codes"
 repository = "https://github.com/marxnoe/MediaLinker-cli"
 homepage = "https://github.com/marxnoe/MediaLinker-cli"
-publish = false
+license = "MIT"
+readme = "README.md"
+keywords = ["medialinker", "share", "cli", "upload"]
+categories = ["command-line-utilities"]
+include = ["/src", "/Cargo.toml", "/Cargo.lock", "/README.md", "/LICENSE*"]
 
 [[bin]]
 name = "ml"
 path = "src/main.rs"
 
-[package.metadata.dist]
-# publish = false keeps it off crates.io; this still lets dist build releases.
-dist = true
+# Lets `cargo binstall medialinker-cli` fetch the prebuilt cargo-dist archives.
+[package.metadata.binstall]
+pkg-url = "{ repo }/releases/download/v{ version }/{ name }-{ target }{ archive-suffix }"
+bin-dir = "{ name }-{ target }/{ bin }{ binary-ext }"
+pkg-fmt = "txz"
+
+[package.metadata.binstall.overrides.x86_64-pc-windows-msvc]
+pkg-fmt = "zip"
+bin-dir = "{ bin }{ binary-ext }"
 
 [dependencies]
 clap = { version = "4.6.7", features = ["derive"] }
