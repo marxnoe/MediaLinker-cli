@@ -22,3 +22,7 @@ publish-jobs = ["./publish-crates"]
 # Build ARM Linux natively instead of cross-compiling.
 aarch64-unknown-linux-gnu = "ubuntu-24.04-arm"
 
+
+[dist.github-custom-job-permissions]
+# The repo is private, so the publish job needs to read it to check out the code.
+publish-crates = { contents = "read", id-token = "write" }
