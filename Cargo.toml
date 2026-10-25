@@ -1,10 +1,11 @@
 [package]
 name = "medialinker-cli"
-version = "0.2.0"
+version = "0.3.0"
 edition = "2024"
 description = "Share files and text through MediaLinker with 5-character codes"
 repository = "https://github.com/marxnoe/MediaLinker-cli"
 homepage = "https://github.com/marxnoe/MediaLinker-cli"
+license = "MIT"
 readme = "README.md"
 keywords = ["medialinker", "share", "cli", "upload"]
 categories = ["command-line-utilities"]

@@ -64,3 +64,7 @@ git tag v0.2.0 && git push origin v0.2.0
 
 The release workflow builds every target, publishes the archives and installers to a GitHub release,
 then publishes the crate to crates.io (needs the `CARGO_REGISTRY_TOKEN` repo secret).
+
+## License
+
+MIT, see [LICENSE](LICENSE).
