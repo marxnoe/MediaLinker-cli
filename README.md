@@ -53,6 +53,21 @@ ml get K7QX2 -o out.jpg      # save under another name (-o - writes to stdout)
 
 `ml get` never overwrites an existing file unless you pass `--force`.
 
+In a terminal, `ml send` also prints a QR code and a link to the receive page, so a phone can open the
+share straight away. `--no-qr` leaves the QR code out; nothing extra is printed when stderr is not a
+terminal, so `CODE=$(ml send file)` stays clean.
+
+## Shell completions
+
+`ml completions <shell>` prints a completion script for `bash`, `zsh`, `fish`, `powershell` or `elvish`:
+
+```sh
+ml completions bash > ~/.local/share/bash-completion/completions/ml
+ml completions zsh > ~/.zfunc/_ml        # with fpath+=~/.zfunc in .zshrc
+ml completions fish > ~/.config/fish/completions/ml.fish
+ml completions powershell >> $PROFILE
+```
+
 ## Releasing
 
 Releases are built by [cargo-dist](https://opensource.axo.dev/cargo-dist/). Bump `version` in
