@@ -99,7 +99,14 @@ pub fn unbundle(zip: &Path, dir: &Path, names: &[String]) -> io::Result<Vec<Path
         if entry.is_symlink() {
             continue;
         }
-        let target = dir.join(rel);
+        // Names from Linux or macOS can hold characters Windows refuses, so every part is cleaned.
+        let target = rel
+            .components()
+            .filter_map(|c| match c {
+                std::path::Component::Normal(part) => Some(safe_component(&part.to_string_lossy())),
+                _ => None,
+            })
+            .fold(dir.to_path_buf(), |path, part| path.join(part));
         if entry.is_dir() {
             fs::create_dir_all(&target)?;
             continue;
@@ -130,13 +137,26 @@ pub fn unbundle(zip: &Path, dir: &Path, names: &[String]) -> io::Result<Vec<Path
 
 /// Never trust a name from another device with the filesystem.
 pub fn safe_name(name: &str) -> String {
-    let base = name.rsplit(['/', '\\']).next().unwrap_or_default();
-    let clean: String = base
+    safe_component(name.rsplit(['/', '\\']).next().unwrap_or_default())
+}
+
+/// One file or folder name that every system can create: no characters Windows refuses, no
+/// trailing dots or spaces, and no Windows device names like `CON` or `nul.txt`.
+fn safe_component(name: &str) -> String {
+    let clean: String = name
         .chars()
-        .filter(|c| !c.is_control() && !matches!(c, ':' | '*' | '?' | '"' | '<' | '>' | '|'))
+        .filter(|c| !c.is_control() && !matches!(c, '/' | '\\' | ':' | '*' | '?' | '"' | '<' | '>' | '|'))
         .collect();
-    let clean = clean.trim().trim_start_matches('.');
-    if clean.is_empty() { "file".into() } else { clean.into() }
+    let clean = clean.trim().trim_start_matches('.').trim_end_matches(['.', ' ']);
+    if clean.is_empty() {
+        return "file".into();
+    }
+    let stem = clean.split('.').next().unwrap_or_default().to_ascii_uppercase();
+    let device = matches!(stem.as_str(), "CON" | "PRN" | "AUX" | "NUL")
+        || (stem.len() == 4
+            && (stem.starts_with("COM") || stem.starts_with("LPT"))
+            && stem.as_bytes()[3].is_ascii_digit());
+    if device { format!("_{clean}") } else { clean.into() }
 }
 
 /// Keeps the newest few received clips, so pasting an older one still works for a while, and drops the rest.
@@ -199,5 +219,29 @@ mod tests {
         assert_eq!(safe_name("../../etc/passwd"), "passwd");
         assert_eq!(safe_name("C:\\x\\a:b.txt"), "ab.txt");
         assert_eq!(safe_name(".."), "file");
+    }
+
+    #[test]
+    fn names_work_on_windows() {
+        assert_eq!(safe_name("con.txt"), "_con.txt");
+        assert_eq!(safe_name("LPT1"), "_LPT1");
+        assert_eq!(safe_name("console.txt"), "console.txt");
+        assert_eq!(safe_name("draft. "), "draft");
+    }
+
+    #[test]
+    fn folders_with_odd_names_unpack() {
+        let root = std::env::temp_dir().join(format!("ml-clip-names-{}", std::process::id()));
+        let src = root.join("src");
+        fs::create_dir_all(src.join("notes: 2026/aux")).unwrap();
+        fs::write(src.join("notes: 2026/aux/what?.txt"), "x").unwrap();
+        let zip = root.join("x.zip");
+        let names = bundle(&[src.join("notes: 2026")], &zip).unwrap();
+        let out = root.join("out");
+        fs::create_dir_all(&out).unwrap();
+        let top = unbundle(&zip, &out, &names).unwrap();
+        assert_eq!(top, [out.join("notes 2026")]);
+        assert_eq!(fs::read_to_string(out.join("notes 2026/_aux/what.txt")).unwrap(), "x");
+        fs::remove_dir_all(root).unwrap();
     }
 }
