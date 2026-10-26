@@ -125,19 +125,23 @@ pub struct PairKeys {
 
 impl Pake {
     pub fn start(code: &Code, sid: &str) -> Result<Self, String> {
+        Ok(Self::with_scalar(code, sid, &random()?))
+    }
+
+    fn with_scalar(code: &Code, sid: &str, wide: &[u8; 64]) -> Self {
         let mut h = Sha512::new();
         h.update(b"ml-clip pake v1\0");
         h.update(sid.as_bytes());
         h.update(b"\0");
         h.update(code.0.as_bytes());
         let generator = RistrettoPoint::from_uniform_bytes(&h.finalize().into());
-        let scalar = Scalar::from_bytes_mod_order_wide(&random()?);
+        let scalar = Scalar::from_bytes_mod_order_wide(wide);
         let public = (scalar * generator).compress().to_bytes();
-        Ok(Self {
+        Self {
             scalar,
             sid: sid.to_string(),
             public,
-        })
+        }
     }
 
     /// Mixes in the other side's share. A wrong code doesn't fail here; it gives keys that don't match.
@@ -199,6 +203,14 @@ mod tests {
             host.finish(&h, &j).unwrap().to_joiner.encode(),
             wrong.finish(&h, &j).unwrap().to_joiner.encode()
         );
+    }
+
+    #[test]
+    fn pake_matches_the_web_page() {
+        // Computed with @noble/curves, which the web page uses.
+        let pake = Pake::with_scalar(&Code::parse("K7X-42PQ").unwrap(), "sid", &[1; 64]);
+        let hex: String = pake.public.iter().map(|b| format!("{b:02x}")).collect();
+        assert_eq!(hex, "1efbb3937a660d88c78184718b522253f1d34b7835eb2ba5c505ae87d34cf278");
     }
 
     #[test]
