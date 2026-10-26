@@ -59,6 +59,15 @@ impl Content {
                 for p in paths {
                     h.update(p.to_string_lossy().as_bytes());
                     h.update(b"\0");
+                    // Copying the same file again after editing it is a new copy.
+                    if let Ok(meta) = std::fs::metadata(p) {
+                        h.update(meta.len().to_le_bytes());
+                        let modified = meta
+                            .modified()
+                            .ok()
+                            .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok());
+                        h.update(modified.unwrap_or_default().as_nanos().to_le_bytes());
+                    }
                 }
             }
         }
@@ -139,8 +148,22 @@ pub fn spawn(copied: impl Fn(Content, u64) + Send + 'static) -> Result<Board, St
                             continue;
                         }
                         let applied = content.fingerprint();
-                        if let Err(e) = write(&mut clipboard, &content) {
-                            eprintln!("Cannot put the clip on the clipboard: {e}");
+                        // Windows lets one program at a time hold the clipboard, so a busy one is retried.
+                        let mut attempt = 0;
+                        let written = loop {
+                            match write(&mut clipboard, &content) {
+                                Ok(()) => break true,
+                                Err(e) if attempt == 4 => {
+                                    eprintln!("Cannot put the clip on the clipboard: {e}");
+                                    break false;
+                                }
+                                Err(_) => {
+                                    attempt += 1;
+                                    thread::sleep(Duration::from_millis(100 * attempt));
+                                }
+                            }
+                        };
+                        if !written {
                             continue;
                         }
                         // Some systems hand out the new content a moment after it was set.
@@ -260,7 +283,11 @@ fn write(clipboard: &mut Clipboard, content: &Content) -> Result<(), ClipError> 
         Content::Files(paths) => {
             super::linux_files::set(paths, false).map_err(|description| ClipError::Unknown { description })
         }
-        #[cfg(not(target_os = "linux"))]
+        #[cfg(windows)]
+        Content::Files(paths) => {
+            super::windows_files::set(paths).map_err(|description| ClipError::Unknown { description })
+        }
+        #[cfg(not(any(target_os = "linux", windows)))]
         Content::Files(paths) => clipboard.set().file_list(paths),
     }
 }

@@ -13,7 +13,7 @@
 use std::{
     collections::HashMap,
     fs::{self, File},
-    io::{self, Read, Write},
+    io::{self, Read, Seek, Write},
     path::PathBuf,
     sync::{
         Arc, Mutex,
@@ -97,12 +97,16 @@ impl Meta {
 #[derive(Clone)]
 enum Blob {
     Bytes(Arc<[u8]>),
-    File { path: PathBuf, temporary: bool },
+    /// A zip of several files, deleted when no longer needed.
+    Zip(PathBuf),
+    /// A single copied file, opened right away: if it is cut and pasted (moved) before the upload
+    /// is done, the open handle still reads it.
+    File(Arc<File>),
 }
 
 impl Blob {
     fn discard(self) {
-        if let Blob::File { path, temporary: true } = self {
+        if let Blob::Zip(path) = self {
             let _ = fs::remove_file(path);
         }
     }
@@ -110,7 +114,12 @@ impl Blob {
     fn open(&self) -> io::Result<Box<dyn Read + Send>> {
         Ok(match self {
             Blob::Bytes(b) => Box::new(io::Cursor::new(b.clone())),
-            Blob::File { path, .. } => Box::new(File::open(path)?),
+            Blob::Zip(path) => Box::new(File::open(path)?),
+            Blob::File(file) => {
+                let mut f = file.try_clone()?;
+                f.seek(io::SeekFrom::Start(0))?;
+                Box::new(f)
+            }
         })
     }
 }
@@ -706,13 +715,8 @@ fn prepare(content: Content, id: &str, from: String, max: u64) -> Result<Outgoin
                     name: Some(files::display_name(path)),
                     ..Meta::default()
                 };
-                (
-                    meta,
-                    Blob::File {
-                        path: path.clone(),
-                        temporary: false,
-                    },
-                )
+                let file = File::open(path).map_err(|e| format!("cannot read {}: {e}", path.display()))?;
+                (meta, Blob::File(Arc::new(file)))
             } else {
                 let dir = files::outgoing_dir();
                 fs::create_dir_all(&dir).map_err(|e| format!("cannot create {}: {e}", dir.display()))?;
@@ -721,10 +725,7 @@ fn prepare(content: Content, id: &str, from: String, max: u64) -> Result<Outgoin
                     let _ = fs::remove_file(&zip);
                     format!("cannot pack the files: {e}")
                 })?;
-                let blob = Blob::File {
-                    path: zip.clone(),
-                    temporary: true,
-                };
+                let blob = Blob::Zip(zip.clone());
                 let size = fs::metadata(&zip).map(|m| m.len()).unwrap_or_default();
                 if size > max {
                     blob.discard();
