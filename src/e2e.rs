@@ -41,6 +41,10 @@ impl SecretKey {
         Ok(Self(key))
     }
 
+    pub fn from_bytes(bytes: [u8; KEY_BYTES]) -> Self {
+        Self(bytes)
+    }
+
     pub fn parse(encoded: &str) -> Option<Self> {
         let raw = URL_SAFE_NO_PAD.decode(encoded.trim()).ok()?;
         Some(Self(raw.try_into().ok()?))
@@ -53,6 +57,31 @@ impl SecretKey {
     fn cipher(&self) -> Aes256Gcm {
         Aes256Gcm::new(Key::<Aes256Gcm>::from_slice(&self.0))
     }
+}
+
+/// Seals a small message in one go.
+pub fn seal(key: &SecretKey, kind: &str, content: Vec<u8>) -> Vec<u8> {
+    let header = Header {
+        kind: kind.into(),
+        name: None,
+        mime: None,
+    };
+    let mut sealed = Vec::new();
+    Encryptor::new(key, &header, Box::new(io::Cursor::new(content)))
+        .read_to_end(&mut sealed)
+        .expect("sealing bytes in memory can't fail");
+    sealed
+}
+
+/// Opens a message from [`seal`], checking it is of the expected kind.
+pub fn unseal(key: &SecretKey, kind: &str, sealed: Vec<u8>) -> io::Result<Vec<u8>> {
+    let (header, mut plain) = Decryptor::open(key, Box::new(io::Cursor::new(sealed)))?;
+    if header.kind != kind {
+        return Err(damaged("unexpected message"));
+    }
+    let mut content = Vec::new();
+    plain.read_to_end(&mut content)?;
+    Ok(content)
 }
 
 fn nonce(counter: u64, last: bool) -> [u8; 12] {
