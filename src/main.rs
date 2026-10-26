@@ -1,5 +1,7 @@
 //! `ml`: share files and text through a MediaLinker server with 5-character codes.
 
+mod e2e;
+
 use std::{
     env,
     fs::{self, File},
@@ -10,6 +12,7 @@ use std::{
 
 use clap::{CommandFactory, Parser, Subcommand, ValueEnum};
 use clap_complete::Shell;
+use e2e::{Decryptor, Encryptor, Header, SecretKey};
 use qrcode::{QrCode, render::unicode::Dense1x2};
 use serde::Deserialize;
 use ureq::{Agent, SendBody, http::Response};
@@ -42,10 +45,17 @@ enum Command {
         /// Don't print a QR code for the receive page
         #[arg(long)]
         no_qr: bool,
+        /// Encrypt before uploading, so the server never sees the content; prints CODE.KEY
+        #[arg(long, short)]
+        encrypt: bool,
     },
     /// Fetch a share: print text, or download a file into the current directory
     Get {
+        /// The code, CODE.KEY for an encrypted share, or a link from the web page
         code: String,
+        /// The key of an encrypted share, if it isn't part of the code
+        #[arg(long, short, value_name = "KEY")]
+        key: Option<String>,
         /// Where to save a file (`-` writes it to stdout)
         #[arg(long, short, value_name = "PATH")]
         output: Option<PathBuf>,
@@ -94,6 +104,8 @@ struct Share {
     text: Option<String>,
     name: Option<String>,
     size: u64,
+    #[serde(default)]
+    encrypted: bool,
 }
 
 #[derive(Deserialize)]
@@ -127,8 +139,19 @@ fn run(cli: Cli) -> Result<()> {
             name,
             ttl,
             no_qr,
-        } => send(&server(cli.server)?, input, text, name, ttl, !no_qr),
-        Command::Get { code, output, force } => get(&server(cli.server)?, &code, output, force),
+            encrypt,
+        } => send(&server(cli.server)?, input, text, name, ttl, !no_qr, encrypt),
+        Command::Get {
+            code,
+            key,
+            output,
+            force,
+        } => {
+            let target = Target::parse(&code, key)?;
+            // A link names its own server, unless one was asked for explicitly.
+            let server = server(cli.server.or(target.server.clone()))?;
+            get(&server, &target, output, force)
+        }
         Command::Completions { shell } => {
             clap_complete::generate(shell, &mut Cli::command(), "ml", &mut io::stdout());
             Ok(())
@@ -249,19 +272,52 @@ fn quote(name: &str) -> String {
         .collect()
 }
 
-fn send(server: &str, input: Vec<String>, text: bool, name: Option<String>, ttl: Ttl, qr: bool) -> Result<()> {
+/// The server can't check the size of encrypted text, so `ml` keeps to the same limit as plain text.
+const MAX_TEXT_BYTES: usize = 1024 * 1024;
+
+fn send(
+    server: &str,
+    input: Vec<String>,
+    text: bool,
+    name: Option<String>,
+    ttl: Ttl,
+    qr: bool,
+    encrypt: bool,
+) -> Result<()> {
     let boundary = format!("ml-{:016x}{:016x}", rand_u64(), rand_u64());
-    let (head, body): (String, Box<dyn Read>) = match payload(input, text, name)? {
-        Payload::Text(t) => {
-            if t.trim().is_empty() {
-                return Err("text is empty".into());
+    let payload = payload(input, text, name)?;
+    if let Payload::Text(t) = &payload
+        && t.trim().is_empty()
+    {
+        return Err("text is empty".into());
+    }
+    let key = encrypt.then(SecretKey::generate).transpose()?;
+    let (head, body): (String, Box<dyn Read>) = match (payload, &key) {
+        (Payload::Text(t), Some(key)) => {
+            if t.len() > MAX_TEXT_BYTES {
+                return Err("text exceeds the 1 MB limit".into());
             }
-            (
-                "Content-Disposition: form-data; name=\"text\"\r\n\r\n".into(),
-                Box::new(io::Cursor::new(t.into_bytes())),
-            )
+            let header = Header {
+                kind: "text".into(),
+                name: None,
+                mime: None,
+            };
+            let content = Box::new(io::Cursor::new(t.into_bytes()));
+            (encrypted_head(), Box::new(Encryptor::new(key, &header, content)))
         }
-        Payload::File { name, reader } => (
+        (Payload::File { name, reader }, Some(key)) => {
+            let header = Header {
+                kind: "file".into(),
+                name: Some(name),
+                mime: None,
+            };
+            (encrypted_head(), Box::new(Encryptor::new(key, &header, reader)))
+        }
+        (Payload::Text(t), None) => (
+            "Content-Disposition: form-data; name=\"text\"\r\n\r\n".into(),
+            Box::new(io::Cursor::new(t.into_bytes())),
+        ),
+        (Payload::File { name, reader }, None) => (
             format!(
                 "Content-Disposition: form-data; name=\"file\"; filename=\"{}\"\r\n\
                  Content-Type: application/octet-stream\r\n\r\n",
@@ -274,8 +330,9 @@ fn send(server: &str, input: Vec<String>, text: bool, name: Option<String>, ttl:
         .chain(body)
         .chain(io::Cursor::new(format!("\r\n--{boundary}--\r\n")));
 
+    let flag = if key.is_some() { "&encrypted=1" } else { "" };
     let res = agent()
-        .post(format!("{server}/share?ttl={}", ttl.as_str()))
+        .post(format!("{server}/share?ttl={}{flag}", ttl.as_str()))
         .header("Content-Type", format!("multipart/form-data; boundary={boundary}"))
         .send(SendBody::from_reader(&mut multipart))
         .map_err(net_err(server))?;
@@ -283,16 +340,74 @@ fn send(server: &str, input: Vec<String>, text: bool, name: Option<String>, ttl:
         .body_mut()
         .read_json()
         .map_err(|e| format!("unexpected answer from server: {e}"))?;
-    println!("{}", created.code);
+    // The key only ever goes into what we print; the server got ciphertext.
+    let secret = key.map(|k| k.encode());
+    match &secret {
+        Some(k) => println!("{}.{k}", created.code),
+        None => println!("{}", created.code),
+    }
     if io::stderr().is_terminal() {
-        let link = format!("{server}/?code={}", created.code);
+        let link = match &secret {
+            Some(k) => format!("{server}/?code={}#k={k}", created.code),
+            None => format!("{server}/?code={}", created.code),
+        };
         if qr && let Some(code) = qr_code(&link) {
             eprint!("{code}");
         }
         eprintln!("Open {link}");
+        if secret.is_some() {
+            eprintln!("End-to-end encrypted: the code alone won't open it, pass on the link or CODE.KEY");
+        }
         eprintln!("Expires in {} ({})", ttl.as_str(), expiry(created.expires_at));
     }
     Ok(())
+}
+
+/// Encrypted shares are always an opaque file; the real name and kind are inside the ciphertext.
+fn encrypted_head() -> String {
+    "Content-Disposition: form-data; name=\"file\"; filename=\"encrypted.bin\"\r\n\
+     Content-Type: application/octet-stream\r\n\r\n"
+        .into()
+}
+
+/// What `ml get` was pointed at: a code, `CODE.KEY`, or a web page link with the key in its fragment.
+struct Target {
+    server: Option<String>,
+    code: String,
+    key: Option<SecretKey>,
+}
+
+impl Target {
+    fn parse(input: &str, key: Option<String>) -> Result<Self> {
+        let input = input.trim();
+        let (server, code, from_input) = if input.starts_with("http://") || input.starts_with("https://") {
+            let (rest, fragment) = input.split_once('#').unwrap_or((input, ""));
+            let scheme_end = rest.find("://").unwrap() + 3;
+            let host_end = rest[scheme_end..]
+                .find(['/', '?'])
+                .map_or(rest.len(), |i| scheme_end + i);
+            let code = rest[host_end..]
+                .split_once('?')
+                .and_then(|(_, q)| q.split('&').find_map(|p| p.strip_prefix("code=")))
+                .ok_or("that link has no share code in it")?;
+            let key = fragment.strip_prefix("k=").filter(|k| !k.is_empty());
+            (Some(rest[..host_end].to_string()), code, key)
+        } else {
+            match input.split_once('.') {
+                Some((code, key)) => (None, code, Some(key)),
+                None => (None, input, None),
+            }
+        };
+        let code = code.to_ascii_uppercase();
+        if code.len() != 5 || !code.bytes().all(|b| b.is_ascii_alphanumeric()) {
+            return Err(format!("{code:?} is not a share code (codes are 5 letters and digits)"));
+        }
+        let key = match key.as_deref().or(from_input) {
+            Some(k) => Some(SecretKey::parse(k).ok_or("that key is not valid (it should be 43 characters)")?),
+            None => None,
+        };
+        Ok(Self { server, code, key })
+    }
 }
 
 /// Renders `link` as a QR code in half-block characters, dark on light so it scans on any terminal theme.
@@ -305,15 +420,11 @@ fn qr_code(link: &str) -> Option<String> {
     Some(art.lines().map(|l| format!("\x1b[30;107m{l}\x1b[0m\n")).collect())
 }
 
-fn get(server: &str, code: &str, output: Option<PathBuf>, force: bool) -> Result<()> {
-    let code = code.trim().to_ascii_uppercase();
-    if code.len() != 5 || !code.bytes().all(|b| b.is_ascii_alphanumeric()) {
-        return Err(format!("{code:?} is not a share code (codes are 5 letters and digits)"));
-    }
+fn get(server: &str, target: &Target, output: Option<PathBuf>, force: bool) -> Result<()> {
     let agent = agent();
     let share: Share = check(
         agent
-            .get(format!("{server}/share/{code}"))
+            .get(format!("{server}/share/{}", target.code))
             .call()
             .map_err(net_err(server))?,
     )?
@@ -321,18 +432,17 @@ fn get(server: &str, code: &str, output: Option<PathBuf>, force: bool) -> Result
     .read_json()
     .map_err(|e| format!("unexpected answer from server: {e}"))?;
 
+    if share.encrypted {
+        let key = target
+            .key
+            .as_ref()
+            .ok_or("this share is end-to-end encrypted: pass the link or CODE.KEY you were given, or --key KEY")?;
+        return get_encrypted(&agent, server, &share, key, output, force);
+    }
+
     if share.kind == "text" {
         let text = share.text.unwrap_or_default();
-        return match output {
-            Some(path) if path != Path::new("-") => write_new(&path, force, &mut text.as_bytes()).map(|_| ()),
-            _ => {
-                print!("{text}");
-                if !text.ends_with('\n') && io::stdout().is_terminal() {
-                    println!();
-                }
-                Ok(())
-            }
-        };
+        return print_text(text, output, force);
     }
 
     let mut res = check(
@@ -354,6 +464,64 @@ fn get(server: &str, code: &str, output: Option<PathBuf>, force: bool) -> Result
     }
     eprintln!("Saved {} ({})", path.display(), human_size(size));
     Ok(())
+}
+
+/// Downloads and decrypts as it goes; a wrong key or any tampering fails before anything is kept.
+fn get_encrypted(
+    agent: &Agent,
+    server: &str,
+    share: &Share,
+    key: &SecretKey,
+    output: Option<PathBuf>,
+    force: bool,
+) -> Result<()> {
+    let res = check(
+        agent
+            .get(format!("{server}/s/{}/file?download=1", share.code))
+            .call()
+            .map_err(net_err(server))?,
+    )?;
+    let (header, mut plain) =
+        Decryptor::open(key, Box::new(res.into_body().into_reader())).map_err(|e| format!("cannot decrypt: {e}"))?;
+
+    if header.kind == "text" {
+        let mut bytes = Vec::new();
+        plain
+            .read_to_end(&mut bytes)
+            .map_err(|e| format!("cannot decrypt: {e}"))?;
+        let text = String::from_utf8(bytes).map_err(|_| "the decrypted text is not UTF-8")?;
+        return print_text(text, output, force);
+    }
+
+    if output.as_deref() == Some(Path::new("-")) {
+        // Stdout can't be taken back, so check the whole share before writing any of it.
+        let mut bytes = Vec::new();
+        plain
+            .read_to_end(&mut bytes)
+            .map_err(|e| format!("cannot decrypt: {e}"))?;
+        io::stdout()
+            .lock()
+            .write_all(&bytes)
+            .map_err(|e| format!("cannot write to stdout: {e}"))?;
+        return Ok(());
+    }
+    let path = output.unwrap_or_else(|| PathBuf::from(safe_name(header.name.as_deref())));
+    let size = write_new(&path, force, &mut plain)?;
+    eprintln!("Saved {} ({}, decrypted)", path.display(), human_size(size));
+    Ok(())
+}
+
+fn print_text(text: String, output: Option<PathBuf>, force: bool) -> Result<()> {
+    match output {
+        Some(path) if path != Path::new("-") => write_new(&path, force, &mut text.as_bytes()).map(|_| ()),
+        _ => {
+            print!("{text}");
+            if !text.ends_with('\n') && io::stdout().is_terminal() {
+                println!();
+            }
+            Ok(())
+        }
+    }
 }
 
 /// Writes to a temporary file next to `path` and moves it into place, so a failed download leaves nothing behind.
@@ -471,6 +639,27 @@ mod tests {
         for sub in ["send", "get", "server", "completions"] {
             assert!(script.contains(sub), "{sub} missing");
         }
+    }
+
+    #[test]
+    fn targets_take_codes_keys_and_links() {
+        let key = SecretKey::generate().unwrap().encode();
+        let t = Target::parse(" k7qx2 ", None).unwrap();
+        assert_eq!((t.code.as_str(), t.server, t.key.is_none()), ("K7QX2", None, true));
+
+        let t = Target::parse(&format!("K7QX2.{key}"), None).unwrap();
+        assert_eq!(t.key.unwrap().encode(), key);
+
+        let link = format!("http://localhost:3000/?code=K7QX2#k={key}");
+        let t = Target::parse(&link, None).unwrap();
+        assert_eq!(t.server.as_deref(), Some("http://localhost:3000"));
+        assert_eq!(t.code, "K7QX2");
+        assert_eq!(t.key.unwrap().encode(), key);
+
+        let t = Target::parse("https://m.example.com/?code=K7QX2", Some(key.clone())).unwrap();
+        assert_eq!(t.key.unwrap().encode(), key);
+        assert!(Target::parse("K7QX2.nope", None).is_err());
+        assert!(Target::parse("https://m.example.com/", None).is_err());
     }
 
     #[test]
