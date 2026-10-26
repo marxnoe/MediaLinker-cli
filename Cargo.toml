@@ -1,6 +1,6 @@
 [package]
 name = "medialinker-cli"
-version = "0.5.0"
+version = "0.6.0"
 edition = "2024"
 description = "Share files and text through MediaLinker with 5-character codes, and keep one clipboard on all your devices"
 repository = "https://github.com/marxnoe/MediaLinker-cli"
