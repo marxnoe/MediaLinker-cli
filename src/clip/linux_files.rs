@@ -49,7 +49,9 @@ fn formats(paths: &[impl AsRef<Path>]) -> Vec<(&'static str, Vec<u8>)> {
     ]
 }
 
-pub fn set(paths: &[impl AsRef<Path>]) -> Result<(), String> {
+/// Offers `paths` on the clipboard. With `wait`, keeps serving them on this thread until something
+/// else is copied; otherwise a background thread does.
+pub fn set(paths: &[impl AsRef<Path>], wait: bool) -> Result<(), String> {
     let formats = formats(paths);
     if std::env::var_os("WAYLAND_DISPLAY").is_some() {
         let sources = formats
@@ -60,14 +62,16 @@ pub fn set(paths: &[impl AsRef<Path>]) -> Result<(), String> {
                 mime_type: MimeType::Specific((*mime).into()),
             })
             .collect();
-        if Options::new().copy_multi(sources).is_ok() {
+        let mut options = Options::new();
+        options.foreground(wait);
+        if options.copy_multi(sources).is_ok() {
             return Ok(());
         }
     }
-    x11_set(formats).map_err(|e| format!("cannot put the files on the clipboard: {e}"))
+    x11_set(formats, wait).map_err(|e| format!("cannot put the files on the clipboard: {e}"))
 }
 
-fn x11_set(formats: Vec<(&'static str, Vec<u8>)>) -> Result<(), Box<dyn std::error::Error>> {
+fn x11_set(formats: Vec<(&'static str, Vec<u8>)>, wait: bool) -> Result<(), Box<dyn std::error::Error>> {
     let (conn, screen) = x11rb::connect(None)?;
     let root = conn.setup().roots[screen].root;
     let window = conn.generate_id()?;
@@ -98,20 +102,23 @@ fn x11_set(formats: Vec<(&'static str, Vec<u8>)>) -> Result<(), Box<dyn std::err
         return Err("another program holds the clipboard".into());
     }
     conn.flush()?;
-    thread::Builder::new()
-        .name("x11-file-clipboard".into())
-        .spawn(move || {
-            // Serve until another program takes the clipboard over.
-            while let Ok(event) = conn.wait_for_event() {
-                match event {
-                    Event::SelectionRequest(req) => {
-                        let _ = answer(&conn, &req, targets, &offered);
-                    }
-                    Event::SelectionClear(_) => break,
-                    _ => {}
+    // Serve until another program takes the clipboard over.
+    let serve = move || {
+        while let Ok(event) = conn.wait_for_event() {
+            match event {
+                Event::SelectionRequest(req) => {
+                    let _ = answer(&conn, &req, targets, &offered);
                 }
+                Event::SelectionClear(_) => break,
+                _ => {}
             }
-        })?;
+        }
+    };
+    if wait {
+        serve();
+    } else {
+        thread::Builder::new().name("x11-file-clipboard".into()).spawn(serve)?;
+    }
     Ok(())
 }
 

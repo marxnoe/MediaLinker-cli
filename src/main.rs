@@ -643,7 +643,7 @@ mod tests {
         let mut out = Vec::new();
         clap_complete::generate(Shell::Bash, &mut Cli::command(), "ml", &mut out);
         let script = String::from_utf8(out).unwrap();
-        for sub in ["send", "get", "clip", "sync", "pair", "server", "completions"] {
+        for sub in ["send", "get", "clip", "sync", "server", "completions"] {
             assert!(script.contains(sub), "{sub} missing");
         }
     }

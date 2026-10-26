@@ -31,6 +31,7 @@ arboard = { version = "3.7.0", features = ["wayland-data-control"] }
 base64 = "0.22"
 clap = { version = "4.6.7", features = ["derive"] }
 clap_complete = "4.6.11"
+ctrlc = { version = "3.5.2", features = ["termination"] }
 curve25519-dalek = "5"
 dirs = "7.0.0"
 gethostname = "1.1.0"

@@ -17,6 +17,7 @@ use std::{
     path::PathBuf,
     sync::{
         Arc, Mutex,
+        atomic::{AtomicBool, Ordering},
         mpsc::{self, Receiver, RecvTimeoutError, Sender},
     },
     thread,
@@ -29,7 +30,7 @@ use serde_json::json;
 use ureq::{Agent, SendBody};
 
 use super::{
-    Config,
+    Session,
     board::{self, Board, Content, normalize_text},
     files::{self, safe_name},
     keys::{self, RoomKey},
@@ -163,6 +164,7 @@ enum ServerMsg {
     Devices {
         n: usize,
     },
+    Ended,
     Error {
         error: String,
     },
@@ -184,7 +186,7 @@ struct Pending {
 }
 
 struct Sync {
-    config: Config,
+    session: Session,
     room_id: String,
     events: Sender<Event>,
     board: Board,
@@ -200,6 +202,19 @@ struct Sync {
     uploads: HashMap<String, Instant>,
     /// The number of the last local copy handled.
     copies: u64,
+    /// Set on Ctrl+C or when the terminal closes: end the room and stop.
+    stop: Arc<AtomicBool>,
+    /// The server said another device ended the room.
+    ended: bool,
+}
+
+/// How a connection came to an end.
+enum Closed {
+    Lost(String),
+    /// Another device ended the room.
+    Ended,
+    /// This device ended the room.
+    Stopped,
 }
 
 pub fn log(msg: impl AsRef<str>) {
@@ -224,18 +239,18 @@ pub fn agent() -> Agent {
         .into()
 }
 
-/// Runs until the process is stopped, reconnecting whenever the connection drops.
-pub fn run(config: Config) -> Result<(), String> {
+/// Runs until this device or another one ends the room, reconnecting whenever the connection drops.
+pub fn run(session: Session, stop: Arc<AtomicBool>) -> Result<(), String> {
     let (events, rx) = mpsc::channel();
     let copied = events.clone();
     let board = board::spawn(move |content, n| {
         let _ = copied.send(Event::Copied(content, now_ms(), n));
     })?;
     let _ = fs::remove_dir_all(files::outgoing_dir());
-    let max_mb = server_limit(&config.server).unwrap_or(DEFAULT_MAX_MB);
+    let max_mb = server_limit(&session.server).unwrap_or(DEFAULT_MAX_MB);
     let mut sync = Sync {
-        room_id: config.key.room_id(),
-        config,
+        room_id: session.key.room_id(),
+        session,
         events,
         board,
         current: None,
@@ -247,20 +262,35 @@ pub fn run(config: Config) -> Result<(), String> {
         max_bytes: max_mb * 1024 * 1024,
         uploads: HashMap::new(),
         copies: 0,
+        stop,
+        ended: false,
     };
     log(format!(
-        "Syncing the clipboard of {} through {} (Ctrl+C to stop)",
-        sync.config.device, sync.config.server
+        "Syncing the clipboard of {} through {} (Ctrl+C ends the room on all devices)",
+        sync.session.device, sync.session.server
     ));
     let mut backoff = Duration::from_secs(1);
     let mut reported = false;
     loop {
         let started = Instant::now();
-        match net::connect(&sync.config.server, &format!("/clip/ws?room={}", sync.room_id)) {
+        match net::connect(&sync.session.server, &format!("/clip/ws?room={}", sync.room_id)) {
             Ok(socket) => {
                 reported = false;
-                let reason = sync.session(socket, &rx);
-                log(format!("Disconnected: {reason}. Reconnecting…"));
+                match sync.connected(socket, &rx) {
+                    Closed::Stopped => {
+                        log("Ended the room on all devices.");
+                        sync.finish();
+                        return Ok(());
+                    }
+                    Closed::Ended => {
+                        log(
+                            "Another device stopped syncing, so the room ended. Run `ml clip sync` to start a new one.",
+                        );
+                        sync.finish();
+                        return Ok(());
+                    }
+                    Closed::Lost(reason) => log(format!("Disconnected: {reason}. Reconnecting…")),
+                }
                 if started.elapsed() > Duration::from_secs(60) {
                     backoff = Duration::from_secs(1);
                 }
@@ -286,8 +316,33 @@ pub fn run(config: Config) -> Result<(), String> {
                 backoff = Duration::from_secs(1);
                 break;
             }
+            if sync.stop.load(Ordering::SeqCst) {
+                // Offline: one quick try to tell the room, so the others don't sync on without us.
+                if let Ok(mut socket) = net::connect(&sync.session.server, &format!("/clip/ws?room={}", sync.room_id)) {
+                    end_room(&mut socket);
+                }
+                log("Stopped. The other devices will see the room end once this one reaches the server.");
+                sync.finish();
+                return Ok(());
+            }
         }
         backoff = (backoff * 2).min(MAX_BACKOFF);
+    }
+}
+
+/// Tells the room this device is stopping, which ends it for everyone, and waits a moment for the
+/// server to confirm.
+fn end_room(socket: &mut Socket) {
+    if net::send(socket, r#"{"t":"end"}"#.into()).is_err() {
+        return;
+    }
+    let deadline = Instant::now() + Duration::from_secs(2);
+    while Instant::now() < deadline {
+        match net::read(socket) {
+            Ok(Frame::Text(t)) if t.contains(r#""t":"ended""#) => return,
+            Ok(_) => {}
+            Err(_) => return,
+        }
     }
 }
 
@@ -326,8 +381,8 @@ impl WakeClock {
 }
 
 impl Sync {
-    /// Talks to the server until the connection fails; returns why.
-    fn session(&mut self, mut socket: Socket, rx: &Receiver<Event>) -> String {
+    /// Talks to the server until the connection fails or the room ends.
+    fn connected(&mut self, mut socket: Socket, rx: &Receiver<Event>) -> Closed {
         net::set_read_timeout(&socket, Duration::from_millis(100));
         let mut heard = Instant::now();
         let mut pinged = Instant::now();
@@ -340,29 +395,48 @@ impl Sync {
                 }
                 Ok(Frame::Other) => heard = Instant::now(),
                 Ok(Frame::Idle) => {}
-                Err(e) => return e,
+                Err(_) if self.ended => return Closed::Ended,
+                Err(e) => return Closed::Lost(e),
+            }
+            if self.ended {
+                return Closed::Ended;
+            }
+            if self.stop.load(Ordering::SeqCst) {
+                end_room(&mut socket);
+                return Closed::Stopped;
             }
             while let Ok(ev) = rx.try_recv() {
                 self.handle(ev);
             }
             for msg in std::mem::take(&mut self.outbox) {
                 if let Err(e) = net::send(&mut socket, msg) {
-                    return e;
+                    return Closed::Lost(e);
                 }
             }
             if pinged.elapsed() >= PING_EVERY {
                 pinged = Instant::now();
                 if let Err(e) = net::send(&mut socket, r#"{"t":"ping"}"#.into()) {
-                    return e;
+                    return Closed::Lost(e);
                 }
             }
             if heard.elapsed() > DEAD_AFTER {
-                return "the server stopped answering".into();
+                return Closed::Lost("the server stopped answering".into());
             }
             if clock.woke() {
-                return "woke from sleep".into();
+                return Closed::Lost("woke from sleep".into());
             }
         }
+    }
+
+    /// Stops watching the clipboard, keeping the last clip from another device pasteable.
+    fn finish(&self) {
+        let kept = self.board.release();
+        #[cfg(target_os = "linux")]
+        if let Some(content) = kept {
+            super::keep::hand_over(content);
+        }
+        #[cfg(not(target_os = "linux"))]
+        let _ = kept;
     }
 
     fn set_current(&mut self, id: &str, at: u64) {
@@ -426,7 +500,7 @@ impl Sync {
         let Ok(id) = keys::new_id() else { return };
         let at = (copied_at as i64 + self.offset).max(0) as u64;
         self.set_current(&id, at);
-        let from = self.config.device.clone();
+        let from = self.session.device.clone();
         if let Content::Text(text) = &content
             && text.len() <= INLINE_TEXT
         {
@@ -457,7 +531,7 @@ impl Sync {
 
     fn announce(&mut self, id: String, at: u64, out: Outgoing) {
         let meta_json = serde_json::to_vec(&out.meta).unwrap_or_default();
-        let sealed = e2e::seal(&self.config.key.meta_key(&id), "clip", meta_json);
+        let sealed = e2e::seal(&self.session.key.meta_key(&id), "clip", meta_json);
         let msg = json!({
             "t": "clip",
             "id": id,
@@ -484,16 +558,7 @@ impl Sync {
                 self.devices = devices;
                 log(format!("Connected · {}", devices_text(devices)));
                 if let Some(c) = clip {
-                    if self.current.is_none() && self.config.seen.as_deref() == Some(c.id.as_str()) {
-                        // Already on this clipboard before the restart.
-                        self.current = Some(Current {
-                            id: c.id.clone(),
-                            at: c.at,
-                        });
-                        *self.latest.lock().unwrap() = c.id;
-                    } else {
-                        self.on_clip(c);
-                    }
+                    self.on_clip(c);
                 }
                 // Anything queued while offline is in `pending` already; send it once.
                 self.outbox.clear();
@@ -518,6 +583,7 @@ impl Sync {
                     log(format!("  {}", devices_text(n)));
                 }
             }
+            ServerMsg::Ended => self.ended = true,
             ServerMsg::Error { error } => log(format!("Server: {error}")),
             ServerMsg::Other => {}
         }
@@ -529,7 +595,6 @@ impl Sync {
         {
             // Our own clip, accepted: the server's time is the one everybody compares against.
             cur.at = c.at;
-            self.remember(&c.id);
             if let Some(p) = self.pending.take_if(|p| p.id == c.id)
                 && let Some((blob, meta)) = p.blob
             {
@@ -543,11 +608,10 @@ impl Sync {
             return;
         }
         self.set_current(&c.id, c.at);
-        self.remember(&c.id);
         let meta = URL_SAFE_NO_PAD
             .decode(&c.meta)
             .ok()
-            .and_then(|sealed| e2e::unseal(&self.config.key.meta_key(&c.id), "clip", sealed).ok())
+            .and_then(|sealed| e2e::unseal(&self.session.key.meta_key(&c.id), "clip", sealed).ok())
             .and_then(|json| serde_json::from_slice::<Meta>(&json).ok());
         let Some(meta) = meta else {
             log("↓ A clip this device can't decrypt (was it paired with another room?)");
@@ -563,9 +627,9 @@ impl Sync {
             self.board.apply(Content::Text(normalize_text(text)), self.copies);
         } else if c.blob {
             let job = Job {
-                server: self.config.server.clone(),
+                server: self.session.server.clone(),
                 room_id: self.room_id.clone(),
-                key: self.config.key.clone(),
+                key: self.session.key.clone(),
                 id: c.id,
                 latest: self.latest.clone(),
                 events: self.events.clone(),
@@ -575,22 +639,12 @@ impl Sync {
         }
     }
 
-    /// Notes the clip this clipboard holds, so a restart doesn't take it from the room again.
-    fn remember(&mut self, id: &str) {
-        if self.config.seen.as_deref() != Some(id) {
-            self.config.seen = Some(id.into());
-            if let Err(e) = self.config.save() {
-                log(format!("  {e}"));
-            }
-        }
-    }
-
     fn upload(&mut self, id: String, blob: Blob, meta: Meta) {
         self.uploads.insert(id.clone(), Instant::now());
         let job = Job {
-            server: self.config.server.clone(),
+            server: self.session.server.clone(),
             room_id: self.room_id.clone(),
-            key: self.config.key.clone(),
+            key: self.session.key.clone(),
             id,
             latest: self.latest.clone(),
             events: self.events.clone(),
@@ -698,7 +752,7 @@ fn prepare(content: Content, id: &str, from: String, max: u64) -> Result<Outgoin
     })
 }
 
-fn encode_png(width: usize, height: usize, rgba: &[u8]) -> Result<Vec<u8>, String> {
+pub(super) fn encode_png(width: usize, height: usize, rgba: &[u8]) -> Result<Vec<u8>, String> {
     let mut out = Vec::new();
     let mut encoder = png::Encoder::new(&mut out, width as u32, height as u32);
     encoder.set_color(png::ColorType::Rgba);
@@ -714,7 +768,7 @@ fn encode_png(width: usize, height: usize, rgba: &[u8]) -> Result<Vec<u8>, Strin
     Ok(out)
 }
 
-fn decode_png(bytes: &[u8]) -> Result<Content, String> {
+pub(super) fn decode_png(bytes: &[u8]) -> Result<Content, String> {
     let bad = |e: png::DecodingError| format!("the image is damaged: {e}");
     let mut decoder = png::Decoder::new(io::Cursor::new(bytes));
     decoder.set_transformations(png::Transformations::normalize_to_color8() | png::Transformations::ALPHA);

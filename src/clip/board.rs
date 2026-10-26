@@ -78,6 +78,8 @@ pub enum Command {
     /// Puts a clip on the clipboard, unless something was copied here after copy number `copies`,
     /// the last one the caller had seen when it decided: then the local copy is newer and wins.
     Apply { content: Content, copies: u64 },
+    /// Stops the thread and hands back the clip it last applied, if that's still on the clipboard.
+    Release(Sender<Option<Content>>),
 }
 
 /// Tells the clipboard thread what to do; dropping it stops the thread.
@@ -88,6 +90,14 @@ pub struct Board {
 impl Board {
     pub fn apply(&self, content: Content, copies: u64) {
         let _ = self.tx.send(Command::Apply { content, copies });
+    }
+
+    /// Stops watching. Returns the clip from another device that is still on the clipboard: on
+    /// Linux it disappears when this process exits, unless something keeps offering it.
+    pub fn release(&self) -> Option<Content> {
+        let (tx, rx) = mpsc::channel();
+        self.tx.send(Command::Release(tx)).ok()?;
+        rx.recv_timeout(Duration::from_secs(2)).ok().flatten()
     }
 }
 
@@ -115,6 +125,7 @@ pub fn spawn(copied: impl Fn(Content, u64) + Send + 'static) -> Result<Board, St
                 seen: None,
                 full_check: Instant::now(),
                 copies: 0,
+                applied: None,
             };
             // Whatever is on the clipboard at start was copied before syncing began; it isn't news.
             w.last = read(&mut clipboard, true).ok().flatten().map(|c| c.fingerprint());
@@ -137,6 +148,12 @@ pub fn spawn(copied: impl Fn(Content, u64) + Send + 'static) -> Result<Board, St
                         let stored = read(&mut clipboard, true).ok().flatten();
                         w.last = Some(stored.map_or(applied, |c| c.fingerprint()));
                         w.seen = w.changes.count();
+                        w.applied = Some(content);
+                    }
+                    Ok(Command::Release(reply)) => {
+                        w.check(&mut clipboard, true, &copied);
+                        let _ = reply.send(w.applied.take());
+                        return;
                     }
                     Err(RecvTimeoutError::Timeout) => {
                         w.check(&mut clipboard, false, &copied);
@@ -160,6 +177,8 @@ struct Watcher {
     seen: Option<u64>,
     full_check: Instant,
     copies: u64,
+    /// The clip from another device on the clipboard now, until something is copied here.
+    applied: Option<Content>,
 }
 
 impl Watcher {
@@ -185,6 +204,7 @@ impl Watcher {
             return false;
         }
         self.last = Some(fp);
+        self.applied = None;
         self.copies += 1;
         copied(content, self.copies);
         true
@@ -238,7 +258,7 @@ fn write(clipboard: &mut Clipboard, content: &Content) -> Result<(), ClipError> 
         }),
         #[cfg(target_os = "linux")]
         Content::Files(paths) => {
-            super::linux_files::set(paths).map_err(|description| ClipError::Unknown { description })
+            super::linux_files::set(paths, false).map_err(|description| ClipError::Unknown { description })
         }
         #[cfg(not(target_os = "linux"))]
         Content::Files(paths) => clipboard.set().file_list(paths),

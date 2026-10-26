@@ -1,7 +1,13 @@
 //! `ml clip`: one clipboard shared by your devices, end-to-end encrypted, through a MediaLinker server.
+//!
+//! A room lasts one session. The key lives only in the memory of the running `ml clip sync`, and
+//! when any device stops syncing (Ctrl+C, a closed terminal, a restart) it ends the room for all of
+//! them. Pair again to start a new one.
 
 mod board;
 mod files;
+#[cfg(target_os = "linux")]
+mod keep;
 mod keys;
 #[cfg(target_os = "linux")]
 mod linux_files;
@@ -9,17 +15,18 @@ mod net;
 mod sync;
 
 use std::{
-    env,
     fs::{self, File},
-    io::IsTerminal,
-    path::PathBuf,
-    process::Command,
+    io::{BufRead, IsTerminal},
+    sync::{
+        Arc,
+        atomic::{AtomicBool, Ordering},
+    },
     thread,
     time::Duration,
 };
 
 use base64::{Engine, engine::general_purpose::URL_SAFE_NO_PAD};
-use clap::{Subcommand, ValueEnum};
+use clap::Subcommand;
 use keys::{Code, Pake, RoomKey};
 use serde::{Deserialize, Serialize};
 use serde_json::json;
@@ -29,106 +36,30 @@ use crate::{Result, e2e, qr_code};
 
 #[derive(Subcommand)]
 pub enum ClipCommand {
-    /// Keep this device's clipboard in sync. The first time it starts a room and shows a pairing
-    /// code; with a code from another device it joins that device's room instead
+    /// Keep this device's clipboard in sync with your other devices until you stop it. Without a
+    /// code it starts a new room and shows a pairing code; with a code it joins that room. Stopping
+    /// it (Ctrl+C, closing the terminal) ends the room on every device
     Sync {
         /// A pairing code like K7X-42PQ (or the link from its QR code)
         code: Option<String>,
         /// What other devices call this one (default: the computer's name)
         #[arg(long, value_name = "NAME")]
         name: Option<String>,
-        /// Keep syncing after the terminal closes; output goes to a log file
-        #[arg(long)]
-        background: bool,
         /// Don't print a QR code with the pairing code
         #[arg(long)]
         no_qr: bool,
     },
-    /// Show a pairing code that adds another device (a phone, too) to this room
-    Pair {
-        /// Don't print a QR code
-        #[arg(long)]
-        no_qr: bool,
-    },
-    /// Show the room, this device, and whether syncing is running
-    Status,
-    /// Leave the room on this device (the other devices stay paired)
-    Forget,
-    /// Start syncing in the background whenever you log in
-    Autostart { state: Toggle },
+    /// Keeps the last clip pasteable after `ml clip sync` exits (Linux; started by `ml` itself)
+    #[command(hide = true)]
+    Keep,
 }
 
-#[derive(Clone, Copy, ValueEnum)]
-pub enum Toggle {
-    On,
-    Off,
-}
-
-/// What a device remembers about its room, in `clip.json` next to the saved server.
-#[derive(Serialize, Deserialize, Clone)]
-pub struct Config {
+/// The room this run of `ml clip sync` is in. Never written to disk.
+#[derive(Clone)]
+pub struct Session {
     server: String,
-    #[serde(with = "key_string")]
     key: RoomKey,
     device: String,
-    /// The last clip this device took from the room, so a restart doesn't paste it again.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    seen: Option<String>,
-}
-
-mod key_string {
-    use serde::{Deserialize, Deserializer, Serializer, de::Error};
-
-    use super::RoomKey;
-
-    pub fn serialize<S: Serializer>(key: &RoomKey, s: S) -> Result<S::Ok, S::Error> {
-        s.serialize_str(&key.encode())
-    }
-
-    pub fn deserialize<'de, D: Deserializer<'de>>(d: D) -> Result<RoomKey, D::Error> {
-        RoomKey::parse(&String::deserialize(d)?).ok_or_else(|| D::Error::custom("not a room key"))
-    }
-}
-
-fn config_dir() -> Result<PathBuf> {
-    Ok(dirs::config_dir()
-        .ok_or("cannot find a config directory")?
-        .join("medialinker"))
-}
-
-impl Config {
-    fn path() -> Result<PathBuf> {
-        Ok(config_dir()?.join("clip.json"))
-    }
-
-    fn load() -> Result<Option<Self>> {
-        let path = Self::path()?;
-        match fs::read(&path) {
-            Ok(bytes) => serde_json::from_slice(&bytes).map(Some).map_err(|e| {
-                format!(
-                    "{} is damaged ({e}); run `ml clip forget` and pair again",
-                    path.display()
-                )
-            }),
-            Err(_) => Ok(None),
-        }
-    }
-
-    fn save(&self) -> Result<()> {
-        let path = Self::path()?;
-        fs::create_dir_all(path.parent().unwrap()).map_err(|e| format!("cannot create {}: {e}", path.display()))?;
-        let tmp = path.with_extension("json.tmp");
-        let write = || -> std::io::Result<()> {
-            let mut options = fs::OpenOptions::new();
-            options.write(true).create(true).truncate(true);
-            // The room key opens every clip, so only this user may read it.
-            #[cfg(unix)]
-            std::os::unix::fs::OpenOptionsExt::mode(&mut options, 0o600);
-            std::io::Write::write_all(&mut options.open(&tmp)?, &serde_json::to_vec_pretty(self)?)?;
-            fs::rename(&tmp, &path)
-        };
-        write().map_err(|e| format!("cannot write {}: {e}", path.display()))
-    }
 }
 
 fn device_name() -> String {
@@ -142,103 +73,85 @@ fn device_name() -> String {
 }
 
 pub fn run(command: ClipCommand, server: Result<String>) -> Result<()> {
-    match command {
-        ClipCommand::Sync {
-            code,
-            name,
-            background,
-            no_qr,
-        } => sync_command(server, code, name, background, !no_qr),
-        ClipCommand::Pair { no_qr } => {
-            let config = Config::load()?.ok_or("this device isn't in a room yet: run `ml clip sync` first")?;
-            host_pairing(&config, !no_qr, false)
-        }
-        ClipCommand::Status => status(),
-        ClipCommand::Forget => {
-            let path = Config::path()?;
-            if !path.exists() {
-                eprintln!("This device isn't in a clipboard room");
-                return Ok(());
-            }
-            if lock().is_none() {
-                return Err("`ml clip sync` is running on this device; stop it first".into());
-            }
-            fs::remove_file(&path).map_err(|e| format!("cannot remove {}: {e}", path.display()))?;
-            let _ = fs::remove_dir_all(files::cache_dir());
-            eprintln!("Left the room. Other devices stay paired with each other.");
-            Ok(())
-        }
-        ClipCommand::Autostart { state } => autostart(state),
-    }
-}
-
-fn sync_command(
-    server: Result<String>,
-    code: Option<String>,
-    name: Option<String>,
-    background: bool,
-    qr: bool,
-) -> Result<()> {
-    let existing = Config::load()?;
-    let mut fresh = false;
-    let mut config = match (code, existing) {
-        (Some(code), existing) => {
+    let (code, name, no_qr) = match command {
+        ClipCommand::Sync { code, name, no_qr } => (code, name, no_qr),
+        #[cfg(target_os = "linux")]
+        ClipCommand::Keep => return keep::hold(),
+        #[cfg(not(target_os = "linux"))]
+        ClipCommand::Keep => return Ok(()),
+    };
+    let qr = !no_qr;
+    let device = name.unwrap_or_else(device_name);
+    let Some(_lock) = lock() else {
+        return Err("`ml clip sync` is already running on this device".into());
+    };
+    let fresh = code.is_none();
+    let session = match code {
+        Some(code) => {
             // A link names its own server.
             let server = code
                 .split_once("/#clip=")
                 .map(|(s, _)| crate::normalize_server(s))
                 .unwrap_or(server)?;
             let code = Code::parse(&code).ok_or("that is not a pairing code (they look like K7X-42PQ)")?;
-            let device = name
-                .clone()
-                .unwrap_or_else(|| existing.as_ref().map_or_else(device_name, |c| c.device.clone()));
             let (key, host) = join_pairing(&server, &code, &device)?;
-            if existing.is_some_and(|c| c.key.room_id() != key.room_id()) {
-                eprintln!("Left the previous room.");
-            }
             eprintln!("Paired with {host}.");
-            Config {
-                server,
-                key,
-                device,
-                seen: None,
-            }
+            Session { server, key, device }
         }
-        (None, Some(config)) => config,
-        (None, None) => {
-            if background {
-                return Err("pair this device first: run `ml clip sync` (or `ml clip sync CODE`) in a terminal".into());
-            }
-            fresh = true;
-            Config {
-                server: server?,
-                key: RoomKey::generate()?,
-                device: name.clone().unwrap_or_else(device_name),
-                seen: None,
-            }
-        }
+        None => Session {
+            server: server?,
+            key: RoomKey::generate()?,
+            device,
+        },
     };
-    if let Some(name) = name {
-        config.device = name;
-    }
-    config.save()?;
 
-    if background {
-        return spawn_background();
-    }
-    let Some(_lock) = lock() else {
-        return Err("`ml clip sync` is already running on this device".into());
+    let stop = Arc::new(AtomicBool::new(false));
+    let flag = stop.clone();
+    ctrlc::set_handler(move || {
+        if flag.swap(true, Ordering::SeqCst) {
+            std::process::exit(130);
+        }
+        // The sync loop tells the room and exits; this is the fallback if it can't in time (Windows
+        // ends the process soon after a console window closes).
+        thread::sleep(Duration::from_secs(4));
+        std::process::exit(0);
+    })
+    .map_err(|e| format!("cannot watch for Ctrl+C: {e}"))?;
+
+    let pairing = Arc::new(AtomicBool::new(false));
+    let offer = {
+        let session = session.clone();
+        let pairing = pairing.clone();
+        move || {
+            if pairing.swap(true, Ordering::SeqCst) {
+                return;
+            }
+            let session = session.clone();
+            let pairing = pairing.clone();
+            thread::spawn(move || {
+                if let Err(e) = host_pairing(&session, qr) {
+                    log(format!("Pairing: {e}. Press Enter for a new code."));
+                }
+                pairing.store(false, Ordering::SeqCst);
+            });
+        }
     };
+    let interactive = std::io::stdin().is_terminal();
     if fresh {
         eprintln!("Started a new clipboard room. Add your other devices with this code:");
-        let pairing = config.clone();
+        offer();
+    } else if interactive {
+        eprintln!("Press Enter to show a code for another device.");
+    }
+    if interactive {
+        let offer = offer.clone();
         thread::spawn(move || {
-            if let Err(e) = host_pairing(&pairing, qr, true) {
-                log(format!("Pairing: {e}. Run `ml clip pair` for a new code."));
+            for _ in std::io::stdin().lock().lines() {
+                offer();
             }
         });
     }
-    sync::run(config)
+    sync::run(session, stop)
 }
 
 /// Holds the lock that keeps two syncs on one device from fighting over the clipboard.
@@ -253,42 +166,6 @@ fn lock() -> Option<File> {
         .ok()?;
     file.try_lock().ok()?;
     Some(file)
-}
-
-fn log_path() -> PathBuf {
-    files::cache_dir().join("sync.log")
-}
-
-fn spawn_background() -> Result<()> {
-    if lock().is_none() {
-        eprintln!("Already syncing on this device.");
-        return Ok(());
-    }
-    let exe = env::current_exe().map_err(|e| format!("cannot find the ml program: {e}"))?;
-    let log_file = log_path();
-    let out = File::create(&log_file).map_err(|e| format!("cannot create {}: {e}", log_file.display()))?;
-    let err = out.try_clone().map_err(|e| e.to_string())?;
-    let mut cmd = Command::new(exe);
-    cmd.args(["clip", "sync"])
-        .stdin(std::process::Stdio::null())
-        .stdout(out)
-        .stderr(err);
-    #[cfg(unix)]
-    std::os::unix::process::CommandExt::process_group(&mut cmd, 0);
-    #[cfg(windows)]
-    {
-        const DETACHED_PROCESS: u32 = 0x8;
-        const CREATE_NEW_PROCESS_GROUP: u32 = 0x200;
-        const CREATE_NO_WINDOW: u32 = 0x0800_0000;
-        std::os::windows::process::CommandExt::creation_flags(
-            &mut cmd,
-            DETACHED_PROCESS | CREATE_NEW_PROCESS_GROUP | CREATE_NO_WINDOW,
-        );
-    }
-    cmd.spawn()
-        .map_err(|e| format!("cannot start syncing in the background: {e}"))?;
-    eprintln!("Syncing in the background. Log: {}", log_file.display());
-    Ok(())
 }
 
 #[derive(Deserialize)]
@@ -346,19 +223,15 @@ struct Thanks {
     name: String,
 }
 
-/// Shows codes for other devices to join with, until one joins (`once`) or the user stops it.
-/// A wrong code burns that pairing, so a fresh code replaces it.
-fn host_pairing(config: &Config, qr: bool, once: bool) -> Result<()> {
+/// Shows a code for another device to join with, until one joins. A wrong code burns that pairing,
+/// so a fresh code replaces it.
+fn host_pairing(session: &Session, qr: bool) -> Result<()> {
     let mut failures = 0;
     loop {
-        match host_once(config, qr) {
+        match host_once(session, qr) {
             Ok(name) => {
-                log(format!("Paired with {name}."));
-                failures = 0;
-                if once {
-                    return Ok(());
-                }
-                eprintln!("Another device? Here is a new code (Ctrl+C when done):");
+                log(format!("Paired with {name}. Press Enter to add another device."));
+                return Ok(());
             }
             Err(Hosting::Expired(e)) => return Err(e),
             Err(Hosting::Failed(e)) => {
@@ -378,13 +251,13 @@ enum Hosting {
     Failed(String),
 }
 
-fn host_once(config: &Config, qr: bool) -> std::result::Result<String, Hosting> {
+fn host_once(session: &Session, qr: bool) -> std::result::Result<String, Hosting> {
     let failed = Hosting::Failed;
-    let mut socket = net::connect(&config.server, "/clip/pair").map_err(Hosting::Expired)?;
+    let mut socket = net::connect(&session.server, "/clip/pair").map_err(Hosting::Expired)?;
     net::send(&mut socket, r#"{"t":"host"}"#.into()).map_err(failed)?;
     let plate: Plate = net::expect(&mut socket, PAIR_STEP).map_err(Hosting::Expired)?;
     let code = Code::new(&plate.plate).map_err(failed)?;
-    show_code(&config.server, &code, qr);
+    show_code(&session.server, &code, qr);
     let start: Start = net::expect(&mut socket, PAIR_WAIT).map_err(Hosting::Expired)?;
     let pake = Pake::start(&code, &start.sid).map_err(failed)?;
     let mine = pake.public;
@@ -392,8 +265,8 @@ fn host_once(config: &Config, qr: bool) -> std::result::Result<String, Hosting> 
     let theirs = public_key(recv_data(&mut socket).map_err(failed)?).map_err(failed)?;
     let keys = pake.finish(&mine, &theirs).map_err(failed)?;
     let welcome = Welcome {
-        key: config.key.encode(),
-        from: config.device.clone(),
+        key: session.key.encode(),
+        from: session.device.clone(),
     };
     let sealed = e2e::seal(
         &keys.to_joiner,
@@ -449,171 +322,4 @@ fn join_pairing(server: &str, code: &Code, device: &str) -> Result<(RoomKey, Str
     )?;
     let _ = socket.close(None);
     Ok((key, welcome.from))
-}
-
-fn status() -> Result<()> {
-    let Some(config) = Config::load()? else {
-        println!("Not in a clipboard room. Run `ml clip sync` to start one.");
-        return Ok(());
-    };
-    println!("Room:      {}… on {}", &config.key.room_id()[..8], config.server);
-    println!("Device:    {}", config.device);
-    let running = lock().is_none();
-    println!("Syncing:   {}", if running { "yes" } else { "no (run `ml clip sync`)" });
-    println!("Autostart: {}", if autostart_path()?.exists() { "on" } else { "off" });
-    if running && log_path().exists() {
-        println!("Log:       {}", log_path().display());
-    }
-    Ok(())
-}
-
-#[cfg(target_os = "linux")]
-fn autostart_path() -> Result<PathBuf> {
-    Ok(dirs::config_dir()
-        .ok_or("cannot find a config directory")?
-        .join("autostart/ml-clip.desktop"))
-}
-
-#[cfg(target_os = "macos")]
-fn autostart_path() -> Result<PathBuf> {
-    Ok(dirs::home_dir()
-        .ok_or("cannot find the home directory")?
-        .join("Library/LaunchAgents/com.noecore.ml-clip.plist"))
-}
-
-/// Windows keeps the setting in the registry; this file only records that it was turned on.
-#[cfg(windows)]
-fn autostart_path() -> Result<PathBuf> {
-    Ok(config_dir()?.join("autostart"))
-}
-
-#[cfg(not(any(target_os = "linux", target_os = "macos", windows)))]
-fn autostart_path() -> Result<PathBuf> {
-    Err("autostart isn't supported on this system".into())
-}
-
-fn autostart(state: Toggle) -> Result<()> {
-    let path = autostart_path()?;
-    let exe = env::current_exe().map_err(|e| format!("cannot find the ml program: {e}"))?;
-    let exe = exe.to_string_lossy();
-    match state {
-        Toggle::On => {
-            if Config::load()?.is_none() {
-                return Err("pair this device first: run `ml clip sync` (or `ml clip sync CODE`)".into());
-            }
-            let running = lock().is_none();
-            fs::create_dir_all(path.parent().unwrap()).map_err(|e| e.to_string())?;
-            write_autostart(&path, &exe)?;
-            eprintln!("ml clip sync now starts when you log in.");
-            if cfg!(target_os = "macos") {
-                // launchd starts it as soon as the agent is loaded.
-                eprintln!("Log: {}", log_path().display());
-            } else if !running {
-                spawn_background()?;
-            }
-        }
-        Toggle::Off => {
-            remove_autostart(&path)?;
-            eprintln!("ml clip sync no longer starts when you log in. A running sync keeps going until you log out.");
-        }
-    }
-    Ok(())
-}
-
-#[cfg(target_os = "linux")]
-fn write_autostart(path: &std::path::Path, exe: &str) -> Result<()> {
-    let entry = format!(
-        "[Desktop Entry]\nType=Application\nName=MediaLinker clipboard sync\n\
-         Exec=\"{exe}\" clip sync --background\nTerminal=false\nNoDisplay=true\n\
-         X-GNOME-Autostart-enabled=true\n"
-    );
-    fs::write(path, entry).map_err(|e| format!("cannot write {}: {e}", path.display()))
-}
-
-#[cfg(target_os = "macos")]
-fn write_autostart(path: &std::path::Path, exe: &str) -> Result<()> {
-    let log = log_path();
-    let log = log.to_string_lossy();
-    let escape = |s: &str| s.replace('&', "&amp;").replace('<', "&lt;");
-    let plist = format!(
-        r#"<?xml version="1.0" encoding="UTF-8"?>
-<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
-<plist version="1.0">
-<dict>
-  <key>Label</key><string>com.noecore.ml-clip</string>
-  <key>ProgramArguments</key>
-  <array><string>{}</string><string>clip</string><string>sync</string></array>
-  <key>RunAtLoad</key><true/>
-  <key>KeepAlive</key><dict><key>SuccessfulExit</key><false/></dict>
-  <key>StandardErrorPath</key><string>{}</string>
-  <key>StandardOutPath</key><string>{}</string>
-</dict>
-</plist>
-"#,
-        escape(exe),
-        escape(&log),
-        escape(&log)
-    );
-    fs::create_dir_all(files::cache_dir()).map_err(|e| e.to_string())?;
-    fs::write(path, plist).map_err(|e| format!("cannot write {}: {e}", path.display()))?;
-    let _ = Command::new("launchctl").arg("unload").arg(path).output();
-    let ok = Command::new("launchctl")
-        .args(["load", "-w"])
-        .arg(path)
-        .status()
-        .is_ok_and(|s| s.success());
-    if ok {
-        Ok(())
-    } else {
-        Err("launchctl could not load the login item".into())
-    }
-}
-
-#[cfg(windows)]
-fn write_autostart(path: &std::path::Path, exe: &str) -> Result<()> {
-    let ok = Command::new("reg")
-        .args([
-            "add",
-            r"HKCU\Software\Microsoft\Windows\CurrentVersion\Run",
-            "/v",
-            "MediaLinker clip",
-            "/t",
-            "REG_SZ",
-        ])
-        .args(["/d", &format!("\"{exe}\" clip sync --background"), "/f"])
-        .output()
-        .is_ok_and(|o| o.status.success());
-    if !ok {
-        return Err("could not add ml to the programs that start at login".into());
-    }
-    fs::write(path, "on").map_err(|e| e.to_string())
-}
-
-#[cfg(not(any(target_os = "linux", target_os = "macos", windows)))]
-fn write_autostart(_: &std::path::Path, _: &str) -> Result<()> {
-    Err("autostart isn't supported on this system".into())
-}
-
-fn remove_autostart(path: &std::path::Path) -> Result<()> {
-    #[cfg(target_os = "macos")]
-    if path.exists() {
-        let _ = Command::new("launchctl").arg("unload").arg(path).output();
-    }
-    #[cfg(windows)]
-    {
-        let _ = Command::new("reg")
-            .args([
-                "delete",
-                r"HKCU\Software\Microsoft\Windows\CurrentVersion\Run",
-                "/v",
-                "MediaLinker clip",
-                "/f",
-            ])
-            .output();
-    }
-    match fs::remove_file(path) {
-        Ok(()) => Ok(()),
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
-        Err(e) => Err(format!("cannot remove {}: {e}", path.display())),
-    }
 }
