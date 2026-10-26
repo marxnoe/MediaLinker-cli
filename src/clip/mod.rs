@@ -13,6 +13,8 @@ mod keys;
 mod linux_files;
 mod net;
 mod sync;
+#[cfg(windows)]
+mod windows_files;
 
 use std::{
     fs::{self, File},

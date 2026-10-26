@@ -260,7 +260,11 @@ fn write(clipboard: &mut Clipboard, content: &Content) -> Result<(), ClipError> 
         Content::Files(paths) => {
             super::linux_files::set(paths, false).map_err(|description| ClipError::Unknown { description })
         }
-        #[cfg(not(target_os = "linux"))]
+        #[cfg(windows)]
+        Content::Files(paths) => {
+            super::windows_files::set(paths).map_err(|description| ClipError::Unknown { description })
+        }
+        #[cfg(not(any(target_os = "linux", windows)))]
         Content::Files(paths) => clipboard.set().file_list(paths),
     }
 }
