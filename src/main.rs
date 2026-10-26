@@ -1,5 +1,6 @@
 //! `ml`: share files and text through a MediaLinker server with 5-character codes.
 
+mod clip;
 mod e2e;
 
 use std::{
@@ -62,6 +63,11 @@ enum Command {
         /// Overwrite an existing file
         #[arg(long, short)]
         force: bool,
+    },
+    /// Keep the clipboard of your devices in sync, end-to-end encrypted
+    Clip {
+        #[command(subcommand)]
+        command: clip::ClipCommand,
     },
     /// Show the saved server, or save a new one
     Server { url: Option<String> },
@@ -152,6 +158,7 @@ fn run(cli: Cli) -> Result<()> {
             let server = server(cli.server.or(target.server.clone()))?;
             get(&server, &target, output, force)
         }
+        Command::Clip { command } => clip::run(command, server(cli.server)),
         Command::Completions { shell } => {
             clap_complete::generate(shell, &mut Cli::command(), "ml", &mut io::stdout());
             Ok(())
@@ -636,7 +643,7 @@ mod tests {
         let mut out = Vec::new();
         clap_complete::generate(Shell::Bash, &mut Cli::command(), "ml", &mut out);
         let script = String::from_utf8(out).unwrap();
-        for sub in ["send", "get", "server", "completions"] {
+        for sub in ["send", "get", "clip", "sync", "server", "completions"] {
             assert!(script.contains(sub), "{sub} missing");
         }
     }

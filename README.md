@@ -74,6 +74,39 @@ ml get K7QX2 --key 3q9Vh…                  # or the key on its own
 Shares encrypted on the web page open with `ml get`, and the other way round. The code alone can't
 open an encrypted share.
 
+## Shared clipboard
+
+`ml clip sync` keeps one clipboard on your devices for as long as it runs. Copy text, an image, or
+files and folders on one computer and paste them on the others. Copied files arrive as real files,
+so Ctrl+V in Explorer, Finder or a Linux file manager pastes them.
+
+```sh
+ml clip sync                 # first device: starts a room, prints a code like K7X-42PQ and a QR code
+ml clip sync K7X-42PQ        # every other device joins with the code
+```
+
+Press Enter in a running `ml clip sync` to show a code for one more device.
+
+- **One session, nothing saved.** The room key lives only in memory. When any computer stops syncing
+  (Ctrl+C, closing the terminal, a restart or shutdown), it ends the room on every device, and you
+  pair again next time. Sleep and network drops don't end it: devices reconnect by themselves, and
+  a device that slept through the end hears about it when it wakes.
+- **No account.** A pairing code works once, for 10 minutes.
+- **End-to-end encrypted.** The code authenticates a key exchange (CPace), so the devices agree on a
+  room key the server never sees, and a guessed code gets one try, not an offline attack. Every clip
+  is sealed with AES-256-GCM before it leaves the device.
+- **Text, images, files and folders**, up to 100 MB. Several files or a folder travel as one zip
+  and are unpacked on the other side. Received files are kept in the cache folder
+  (`~/.cache/medialinker/clip` on Linux) for the last few clips.
+- **Newest copy wins.** When two devices copy at once, every device ends up with the later one, and a
+  clip never bounces back and forth. A large file only replaces the clipboard once it has fully
+  arrived; until then Ctrl+V pastes what was there before.
+- **Phones** can't watch the clipboard in the background. Scan the QR code, or open the code on the
+  MediaLinker page: it shows the latest clip with a Copy button, and Paste and Send a file buttons to
+  send from the phone. Closing the tab forgets the room; it doesn't end it for the others.
+
+On Linux, `ml` needs a desktop session (X11, or Wayland with Xwayland or the data-control protocol).
+
 ## Shell completions
 
 `ml completions <shell>` prints a completion script for `bash`, `zsh`, `fish`, `powershell` or `elvish`:
