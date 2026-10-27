@@ -95,18 +95,19 @@ pub fn unbundle(zip: &Path, dir: &Path, names: &[String]) -> io::Result<Vec<Path
     let mut archive = ZipArchive::new(File::open(zip)?)?;
     for i in 0..archive.len() {
         let mut entry = archive.by_index(i)?;
-        let Some(rel) = entry.enclosed_name() else { continue };
         if entry.is_symlink() {
             continue;
         }
-        // Names from Linux or macOS can hold characters Windows refuses, so every part is cleaned.
-        let target = rel
-            .components()
-            .filter_map(|c| match c {
-                std::path::Component::Normal(part) => Some(safe_component(&part.to_string_lossy())),
-                _ => None,
-            })
-            .fold(dir.to_path_buf(), |path, part| path.join(part));
+        // Not `enclosed_name`: on Windows it drops any name with a `:`, which Linux and macOS allow.
+        // The name is split by hand instead, and every part cleaned of what Windows refuses.
+        let name = entry.name()?.into_owned();
+        let parts: Vec<&str> = name.split(['/', '\\']).filter(|p| !p.is_empty() && *p != ".").collect();
+        if parts.is_empty() || parts.contains(&"..") {
+            continue;
+        }
+        let target = parts
+            .iter()
+            .fold(dir.to_path_buf(), |path, part| path.join(safe_component(part)));
         if entry.is_dir() {
             fs::create_dir_all(&target)?;
             continue;
@@ -241,6 +242,8 @@ mod tests {
         writer.add_directory("notes: 2026/aux/", options).unwrap();
         writer.start_file("notes: 2026/aux/what?.txt", options).unwrap();
         writer.write_all(b"x").unwrap();
+        writer.start_file("../evil.txt", options).unwrap();
+        writer.write_all(b"x").unwrap();
         writer.finish().unwrap().flush().unwrap();
         let names = ["notes: 2026".to_string()];
         let out = root.join("out");
@@ -248,6 +251,7 @@ mod tests {
         let top = unbundle(&zip, &out, &names).unwrap();
         assert_eq!(top, [out.join("notes 2026")]);
         assert_eq!(fs::read_to_string(out.join("notes 2026/_aux/what.txt")).unwrap(), "x");
+        assert!(!root.join("evil.txt").exists());
         fs::remove_dir_all(root).unwrap();
     }
 }
