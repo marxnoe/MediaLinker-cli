@@ -232,11 +232,17 @@ mod tests {
     #[test]
     fn folders_with_odd_names_unpack() {
         let root = std::env::temp_dir().join(format!("ml-clip-names-{}", std::process::id()));
-        let src = root.join("src");
-        fs::create_dir_all(src.join("notes: 2026/aux")).unwrap();
-        fs::write(src.join("notes: 2026/aux/what?.txt"), "x").unwrap();
+        fs::create_dir_all(&root).unwrap();
+        // Written as a zip, not on disk: Windows can't create these names, but a Mac can send them.
         let zip = root.join("x.zip");
-        let names = bundle(&[src.join("notes: 2026")], &zip).unwrap();
+        let mut writer = ZipWriter::new(BufWriter::new(File::create(&zip).unwrap()));
+        let options = SimpleFileOptions::default();
+        writer.add_directory("notes: 2026/", options).unwrap();
+        writer.add_directory("notes: 2026/aux/", options).unwrap();
+        writer.start_file("notes: 2026/aux/what?.txt", options).unwrap();
+        writer.write_all(b"x").unwrap();
+        writer.finish().unwrap().flush().unwrap();
+        let names = ["notes: 2026".to_string()];
         let out = root.join("out");
         fs::create_dir_all(&out).unwrap();
         let top = unbundle(&zip, &out, &names).unwrap();
