@@ -203,6 +203,7 @@ fn agent() -> Agent {
     Agent::config_builder()
         .http_status_as_error(false)
         .user_agent(concat!("ml/", env!("CARGO_PKG_VERSION")))
+        .tls_config(clip::net::tls_config())
         .build()
         .into()
 }

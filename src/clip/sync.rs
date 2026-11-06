@@ -240,6 +240,7 @@ pub fn agent() -> Agent {
     Agent::config_builder()
         .http_status_as_error(false)
         .user_agent(concat!("ml/", env!("CARGO_PKG_VERSION")))
+        .tls_config(net::tls_config())
         .timeout_connect(Some(Duration::from_secs(10)))
         .timeout_recv_response(Some(Duration::from_secs(60)))
         // A download follows the upload as it happens, so it may take as long as the upload does.

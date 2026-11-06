@@ -4,11 +4,15 @@
 use std::{
     io,
     net::{TcpStream, ToSocketAddrs},
+    sync::Arc,
     time::{Duration, Instant},
 };
 
+use rustls::ClientConfig;
+use rustls_platform_verifier::ConfigVerifierExt;
 use serde::de::DeserializeOwned;
-use tungstenite::{Message, WebSocket, client::IntoClientRequest, stream::MaybeTlsStream};
+use tungstenite::{Connector, Message, WebSocket, client::IntoClientRequest, stream::MaybeTlsStream};
+use ureq::tls::{RootCerts, TlsConfig};
 
 pub type Socket = WebSocket<MaybeTlsStream<TcpStream>>;
 
@@ -22,6 +26,17 @@ pub fn ws_url(server: &str, path: &str) -> String {
         Some((_, rest)) => format!("wss://{rest}{path}"),
         None => format!("wss://{server}{path}"),
     }
+}
+
+/// HTTPS verifies certificates against the OS certificate store, so a CA the OS trusts works like it
+/// does in a browser.
+pub fn tls_config() -> TlsConfig {
+    TlsConfig::builder().root_certs(RootCerts::PlatformVerifier).build()
+}
+
+/// The WebSocket counterpart of [`tls_config`].
+fn connector() -> Result<Connector, rustls::Error> {
+    Ok(Connector::Rustls(Arc::new(ClientConfig::with_platform_verifier()?)))
 }
 
 pub fn connect(server: &str, path: &str) -> Result<Socket, String> {
@@ -56,7 +71,9 @@ pub fn connect(server: &str, path: &str) -> Result<Socket, String> {
         .set_read_timeout(Some(HANDSHAKE_TIMEOUT))
         .and_then(|_| stream.set_write_timeout(Some(WRITE_TIMEOUT)))
         .map_err(|e| unreachable(&e))?;
-    let (socket, _) = tungstenite::client_tls_with_config(request, stream, None, None).map_err(|e| unreachable(&e))?;
+    let connector = connector().map_err(|e| unreachable(&e))?;
+    let (socket, _) =
+        tungstenite::client_tls_with_config(request, stream, None, Some(connector)).map_err(|e| unreachable(&e))?;
     Ok(socket)
 }
 
