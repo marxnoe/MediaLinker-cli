@@ -39,11 +39,13 @@ getrandom = "0.3"
 hmac = "0.13.0"
 png = "0.18.1"
 qrcode = { version = "0.14.1", default-features = false }
+rustls = { version = "0.23", default-features = false, features = ["ring", "std"] }
+rustls-platform-verifier = "0.7"
 serde = { version = "1.0.229", features = ["derive"] }
 serde_json = "1.0.154"
 sha2 = "0.11.1"
 tungstenite = { version = "0.30", features = ["rustls-tls-webpki-roots"] }
-ureq = { version = "3.5.0", features = ["json"] }
+ureq = { version = "3.5.0", features = ["json", "platform-verifier"] }
 zip = { version = "9.1.2", default-features = false, features = ["deflate"] }
 
 [profile.release]

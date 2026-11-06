@@ -11,7 +11,7 @@ mod keep;
 mod keys;
 #[cfg(target_os = "linux")]
 mod linux_files;
-mod net;
+pub mod net;
 mod sync;
 #[cfg(windows)]
 mod windows_files;
