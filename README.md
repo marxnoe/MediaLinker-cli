@@ -87,10 +87,12 @@ ml clip sync K7X-42PQ        # every other device joins with the code
 
 Press Enter in a running `ml clip sync` to show a code for one more device.
 
-- **One session, nothing saved.** The room key lives only in memory. When any computer stops syncing
-  (Ctrl+C, closing the terminal, a restart or shutdown), it ends the room on every device, and you
-  pair again next time. Sleep and network drops don't end it: devices reconnect by themselves, and
-  a device that slept through the end hears about it when it wakes.
+- **One session, nothing saved.** The room key lives only in memory. A computer that stops syncing
+  (Ctrl+C, closing the terminal, a restart or shutdown) leaves the room, and the others carry on.
+  The room ends once every device has left, and you pair again next time. Sleep and network drops
+  don't count as leaving: devices reconnect by themselves. A device that vanishes without leaving
+  (a phone that killed the browser tab, say) stops holding the room open once it has been away for
+  a day and the others have left.
 - **No account.** A pairing code works once, for 10 minutes.
 - **End-to-end encrypted.** The code authenticates a key exchange (CPace), so the devices agree on a
   room key the server never sees, and a guessed code gets one try, not an offline attack. Every clip

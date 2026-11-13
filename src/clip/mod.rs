@@ -1,8 +1,8 @@
 //! `ml clip`: one clipboard shared by your devices, end-to-end encrypted, through a MediaLinker server.
 //!
-//! A room lasts one session. The key lives only in the memory of the running `ml clip sync`, and
-//! when any device stops syncing (Ctrl+C, a closed terminal, a restart) it ends the room for all of
-//! them. Pair again to start a new one.
+//! A room lasts one session. The key lives only in the memory of the running `ml clip sync`. A device
+//! that stops syncing (Ctrl+C, a closed terminal, a restart) leaves the room and the others carry on;
+//! the room ends once every device has left. Pair again to start a new one.
 
 mod board;
 mod files;
@@ -40,7 +40,7 @@ use crate::{Result, e2e, qr_code};
 pub enum ClipCommand {
     /// Keep this device's clipboard in sync with your other devices until you stop it. Without a
     /// code it starts a new room and shows a pairing code; with a code it joins that room. Stopping
-    /// it (Ctrl+C, closing the terminal) ends the room on every device
+    /// it (Ctrl+C, closing the terminal) leaves the room; it ends once every device has left
     Sync {
         /// A pairing code like K7X-42PQ (or the link from its QR code)
         code: Option<String>,
