@@ -162,6 +162,8 @@ enum ServerMsg {
         now: u64,
         clip: Option<ServerClip>,
         devices: usize,
+        #[serde(default)]
+        members: Option<usize>,
     },
     Clip {
         clip: ServerClip,
@@ -172,6 +174,8 @@ enum ServerMsg {
     },
     Devices {
         n: usize,
+        #[serde(default)]
+        members: Option<usize>,
     },
     Ended,
     Error {
@@ -197,12 +201,17 @@ struct Pending {
 struct Sync {
     session: Session,
     room_id: String,
+    /// A random ID for this run, so the server knows this device is still in the room after a
+    /// reconnect. Nothing ties it to the computer.
+    device_id: String,
     events: Sender<Event>,
     board: Board,
     current: Option<Current>,
     /// The server's clock minus ours, in milliseconds.
     offset: i64,
     devices: usize,
+    /// Devices in the room, also the ones away (asleep, or offline).
+    members: usize,
     pending: Option<Pending>,
     outbox: Vec<String>,
     /// The ID of the current clip, for workers to notice they've been overtaken.
@@ -211,19 +220,19 @@ struct Sync {
     uploads: HashMap<String, Instant>,
     /// The number of the last local copy handled.
     copies: u64,
-    /// Set on Ctrl+C or when the terminal closes: end the room and stop.
+    /// Set on Ctrl+C or when the terminal closes: leave the room and stop.
     stop: Arc<AtomicBool>,
-    /// The server said another device ended the room.
+    /// The server said the room ended: every other device left while this one was away.
     ended: bool,
 }
 
 /// How a connection came to an end.
 enum Closed {
     Lost(String),
-    /// Another device ended the room.
+    /// The room ended without this device.
     Ended,
-    /// This device ended the room.
-    Stopped,
+    /// This device left the room; `Some(true)` if it was the last one, `None` if the server didn't say.
+    Left(Option<bool>),
 }
 
 pub fn log(msg: impl AsRef<str>) {
@@ -249,7 +258,7 @@ pub fn agent() -> Agent {
         .into()
 }
 
-/// Runs until this device or another one ends the room, reconnecting whenever the connection drops.
+/// Runs until this device leaves the room or the room ends, reconnecting whenever the connection drops.
 pub fn run(session: Session, stop: Arc<AtomicBool>) -> Result<(), String> {
     let (events, rx) = mpsc::channel();
     let copied = events.clone();
@@ -260,12 +269,14 @@ pub fn run(session: Session, stop: Arc<AtomicBool>) -> Result<(), String> {
     let max_mb = server_limit(&session.server).unwrap_or(DEFAULT_MAX_MB);
     let mut sync = Sync {
         room_id: session.key.room_id(),
+        device_id: URL_SAFE_NO_PAD.encode(keys::random::<16>()?),
         session,
         events,
         board,
         current: None,
         offset: 0,
         devices: 0,
+        members: 0,
         pending: None,
         outbox: Vec::new(),
         latest: Arc::default(),
@@ -276,25 +287,25 @@ pub fn run(session: Session, stop: Arc<AtomicBool>) -> Result<(), String> {
         ended: false,
     };
     log(format!(
-        "Syncing the clipboard of {} through {} (Ctrl+C ends the room on all devices)",
+        "Syncing the clipboard of {} through {} (Ctrl+C leaves the room; it ends once every device has left)",
         sync.session.device, sync.session.server
     ));
     let mut backoff = Duration::from_secs(1);
     let mut reported = false;
     loop {
         let started = Instant::now();
-        match net::connect(&sync.session.server, &format!("/clip/ws?room={}", sync.room_id)) {
+        match net::connect(&sync.session.server, &sync.ws_path()) {
             Ok(socket) => {
                 reported = false;
                 match sync.connected(socket, &rx) {
-                    Closed::Stopped => {
-                        log("Ended the room on all devices.");
+                    Closed::Left(last) => {
+                        log(left_text(last));
                         sync.finish();
                         return Ok(());
                     }
                     Closed::Ended => {
                         log(
-                            "Another device stopped syncing, so the room ended. Run `ml clip sync` to start a new one.",
+                            "The other devices left while this one was away, so the room ended. Run `ml clip sync` to start a new one.",
                         );
                         sync.finish();
                         return Ok(());
@@ -327,11 +338,14 @@ pub fn run(session: Session, stop: Arc<AtomicBool>) -> Result<(), String> {
                 break;
             }
             if sync.stop.load(Ordering::SeqCst) {
-                // Offline: one quick try to tell the room, so the others don't sync on without us.
-                if let Ok(mut socket) = net::connect(&sync.session.server, &format!("/clip/ws?room={}", sync.room_id)) {
-                    end_room(&mut socket);
-                }
-                log("Stopped. The other devices will see the room end once this one reaches the server.");
+                // Offline: one quick try to tell the room, so it can end if this was the last device.
+                let last = net::connect(&sync.session.server, &sync.ws_path())
+                    .ok()
+                    .and_then(|mut socket| leave_room(&mut socket));
+                log(match last {
+                    Some(_) => left_text(last),
+                    None => "Stopped without reaching the server. The room ends once every other device has left, or a day after this one went quiet.".into(),
+                });
                 sync.finish();
                 return Ok(());
             }
@@ -340,19 +354,33 @@ pub fn run(session: Session, stop: Arc<AtomicBool>) -> Result<(), String> {
     }
 }
 
-/// Tells the room this device is stopping, which ends it for everyone, and waits a moment for the
-/// server to confirm.
-fn end_room(socket: &mut Socket) {
-    if net::send(socket, r#"{"t":"end"}"#.into()).is_err() {
-        return;
-    }
+/// Tells the room this device is leaving and waits a moment for the server to confirm; returns
+/// whether it was the last device in the room, if the server said.
+fn leave_room(socket: &mut Socket) -> Option<bool> {
+    // Older servers know only `end`, which ends the room for everyone.
+    net::send(socket, r#"{"t":"leave"}"#.into()).ok()?;
     let deadline = Instant::now() + Duration::from_secs(2);
     while Instant::now() < deadline {
         match net::read(socket) {
-            Ok(Frame::Text(t)) if t.contains(r#""t":"ended""#) => return,
+            Ok(Frame::Text(t)) => {
+                if let Ok(msg) = serde_json::from_str::<serde_json::Value>(&t)
+                    && msg["t"] == "left"
+                {
+                    return Some(msg["last"].as_bool().unwrap_or(false));
+                }
+            }
             Ok(_) => {}
-            Err(_) => return,
+            Err(_) => return None,
         }
+    }
+    None
+}
+
+fn left_text(last: Option<bool>) -> String {
+    match last {
+        Some(true) => "Left the room. It was the last device, so the room ended.".into(),
+        Some(false) => "Left the room. The other devices carry on until they leave too.".into(),
+        None => "Left the room.".into(),
     }
 }
 
@@ -391,6 +419,10 @@ impl WakeClock {
 }
 
 impl Sync {
+    fn ws_path(&self) -> String {
+        format!("/clip/ws?room={}&device={}", self.room_id, self.device_id)
+    }
+
     /// Talks to the server until the connection fails or the room ends.
     fn connected(&mut self, mut socket: Socket, rx: &Receiver<Event>) -> Closed {
         net::set_read_timeout(&socket, Duration::from_millis(100));
@@ -412,8 +444,7 @@ impl Sync {
                 return Closed::Ended;
             }
             if self.stop.load(Ordering::SeqCst) {
-                end_room(&mut socket);
-                return Closed::Stopped;
+                return Closed::Left(leave_room(&mut socket));
             }
             while let Ok(ev) = rx.try_recv() {
                 self.handle(ev);
@@ -563,10 +594,16 @@ impl Sync {
             return;
         };
         match msg {
-            ServerMsg::Hello { now, clip, devices } => {
+            ServerMsg::Hello {
+                now,
+                clip,
+                devices,
+                members,
+            } => {
                 self.offset = now as i64 - now_ms() as i64;
                 self.devices = devices;
-                log(format!("Connected · {}", devices_text(devices)));
+                self.members = members.unwrap_or(devices);
+                log(format!("Connected · {}", devices_text(self.devices, self.members)));
                 if let Some(c) = clip {
                     self.on_clip(c);
                 }
@@ -587,10 +624,12 @@ impl Sync {
                 }
                 self.on_clip(clip);
             }
-            ServerMsg::Devices { n } => {
-                if n != self.devices {
+            ServerMsg::Devices { n, members } => {
+                let members = members.unwrap_or(n);
+                if (n, members) != (self.devices, self.members) {
                     self.devices = n;
-                    log(format!("  {}", devices_text(n)));
+                    self.members = members;
+                    log(format!("  {}", devices_text(n, members)));
                 }
             }
             ServerMsg::Ended => self.ended = true,
@@ -663,11 +702,15 @@ impl Sync {
     }
 }
 
-fn devices_text(n: usize) -> String {
-    match n {
-        1 => "no other device online yet".into(),
+fn devices_text(online: usize, members: usize) -> String {
+    let text = match online {
+        0 | 1 => "no other device online".to_string(),
         2 => "1 other device online".into(),
         n => format!("{} other devices online", n - 1),
+    };
+    match members.saturating_sub(online.max(1)) {
+        0 => text,
+        away => format!("{text}, {away} away"),
     }
 }
 
