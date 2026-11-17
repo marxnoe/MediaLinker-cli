@@ -2,6 +2,7 @@
 
 mod clip;
 mod e2e;
+mod public;
 
 use std::{
     env,
@@ -11,7 +12,7 @@ use std::{
     process::ExitCode,
 };
 
-use clap::{CommandFactory, Parser, Subcommand, ValueEnum};
+use clap::{Args, CommandFactory, Parser, Subcommand, ValueEnum};
 use clap_complete::Shell;
 use e2e::{Decryptor, Encryptor, Header, SecretKey};
 use qrcode::{QrCode, render::unicode::Dense1x2};
@@ -31,25 +32,7 @@ struct Cli {
 #[derive(Subcommand)]
 enum Command {
     /// Share a file or some text and print its code
-    Send {
-        /// A file path, some text, or `-` to read stdin (stdin is also read when nothing is given)
-        input: Vec<String>,
-        /// Send the input as text even if it names a file
-        #[arg(long, short)]
-        text: bool,
-        /// Send stdin as a file with this name instead of as text
-        #[arg(long, short, value_name = "NAME")]
-        name: Option<String>,
-        /// How long the share lives
-        #[arg(long, value_enum, default_value_t = Ttl::Day)]
-        ttl: Ttl,
-        /// Don't print a QR code for the receive page
-        #[arg(long)]
-        no_qr: bool,
-        /// Encrypt before uploading, so the server never sees the content; prints CODE.KEY
-        #[arg(long, short)]
-        encrypt: bool,
-    },
+    Send(SendArgs),
     /// Post a file or some text publicly: listed on the Public page for everyone, and never expires
     Public {
         /// A file path, some text, or `-` to read stdin (stdin is also read when nothing is given)
@@ -78,6 +61,35 @@ enum Command {
         #[arg(long, short)]
         force: bool,
     },
+    /// List public shares, most liked first, like the Public page
+    Browse {
+        /// Only shares whose text or file name contains this
+        search: Vec<String>,
+        /// Newest first instead of most liked
+        #[arg(long)]
+        new: bool,
+        /// Which page of 20 to show
+        #[arg(long, default_value_t = 1, value_name = "N")]
+        page: u32,
+    },
+    /// Read the comments on a public share, or post one
+    Comments {
+        /// The code of a public share, or its link
+        code: String,
+        /// Post this as a comment instead of reading them
+        text: Vec<String>,
+        /// The name to post under (Anonymous if not given); `name#secret` adds a tripcode
+        #[arg(long, short, value_name = "NAME")]
+        name: Option<String>,
+    },
+    /// Like a public share (once per machine, like once per browser on the site)
+    Like {
+        /// The code of a public share, or its link
+        code: String,
+        /// Take the like back
+        #[arg(long)]
+        undo: bool,
+    },
     /// Keep the clipboard of your devices in sync, end-to-end encrypted
     Clip {
         #[command(subcommand)]
@@ -89,7 +101,37 @@ enum Command {
     Completions { shell: Shell },
 }
 
-#[derive(Clone, Copy, ValueEnum)]
+#[derive(Args)]
+struct SendArgs {
+    /// A file path, some text, or `-` to read stdin (stdin is also read when nothing is given)
+    input: Vec<String>,
+    /// Send the input as text even if it names a file
+    #[arg(long, short)]
+    text: bool,
+    /// Send stdin as a file with this name instead of as text
+    #[arg(long, short, value_name = "NAME")]
+    name: Option<String>,
+    /// How long the share lives (`never` only with --link)
+    #[arg(long, value_enum, default_value_t = Ttl::Day)]
+    ttl: Ttl,
+    /// Don't print a QR code
+    #[arg(long)]
+    no_qr: bool,
+    /// Encrypt before uploading, so the server never sees the content; prints CODE.KEY
+    #[arg(long, short)]
+    encrypt: bool,
+    /// Burn after reading: deleted the first time it's opened (short codes only)
+    #[arg(long, short)]
+    burn: bool,
+    /// Make a direct link instead of a short code (plain links take images, audio, video and text)
+    #[arg(long, short)]
+    link: bool,
+    /// Print an is.gd short link instead of the code or link (not for encrypted shares)
+    #[arg(long)]
+    short: bool,
+}
+
+#[derive(Clone, Copy, PartialEq, ValueEnum)]
 enum Ttl {
     #[value(name = "1h")]
     Hour,
@@ -97,6 +139,8 @@ enum Ttl {
     Day,
     #[value(name = "7d")]
     Week,
+    #[value(name = "never")]
+    Never,
 }
 
 impl Ttl {
@@ -105,15 +149,19 @@ impl Ttl {
             Ttl::Hour => "1h",
             Ttl::Day => "24h",
             Ttl::Week => "7d",
+            Ttl::Never => "never",
         }
     }
 }
 
+/// What the server answers to an upload: a code for shares, a URL and file name for direct links.
 #[derive(Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct Created {
-    code: String,
-    /// `null` for public shares, which never expire.
+    code: Option<String>,
+    url: Option<String>,
+    name: Option<String>,
+    /// `null` for public shares and direct links that never expire.
     expires_at: Option<u64>,
 }
 
@@ -127,6 +175,14 @@ struct Share {
     size: u64,
     #[serde(default)]
     encrypted: bool,
+    #[serde(default)]
+    burn: bool,
+    #[serde(default)]
+    public: bool,
+    #[serde(default)]
+    likes: u64,
+    #[serde(default)]
+    comments: u64,
 }
 
 #[derive(Deserialize)]
@@ -154,14 +210,7 @@ fn run(cli: Cli) -> Result<()> {
             Ok(())
         }
         Command::Server { url: Some(url) } => save_server(&url),
-        Command::Send {
-            input,
-            text,
-            name,
-            ttl,
-            no_qr,
-            encrypt,
-        } => send(&server(cli.server)?, input, text, name, ttl, !no_qr, encrypt),
+        Command::Send(args) => send(&server(cli.server)?, args),
         Command::Public {
             input,
             text,
@@ -179,6 +228,15 @@ fn run(cli: Cli) -> Result<()> {
             let server = server(cli.server.or(target.server.clone()))?;
             get(&server, &target, output, force)
         }
+        Command::Browse { search, new, page } => public::browse(&server(cli.server)?, &search.join(" "), new, page),
+        Command::Comments { code, text, name } => {
+            let (server, code) = public_code(cli.server, &code)?;
+            public::comments(&server, &code, &text.join(" "), name)
+        }
+        Command::Like { code, undo } => {
+            let (server, code) = public_code(cli.server, &code)?;
+            public::like(&server, &code, undo)
+        }
         Command::Clip { command } => clip::run(command, server(cli.server)),
         Command::Completions { shell } => {
             clap_complete::generate(shell, &mut Cli::command(), "ml", &mut io::stdout());
@@ -187,8 +245,21 @@ fn run(cli: Cli) -> Result<()> {
     }
 }
 
+/// The server and code a public share command was pointed at, from a code or a link.
+fn public_code(flag: Option<String>, input: &str) -> Result<(String, String)> {
+    let target = Target::parse(input, None)?;
+    if target.file.is_some() {
+        return Err("that's a direct link, not a public share".into());
+    }
+    Ok((server(flag.or(target.server))?, target.code))
+}
+
+fn config_dir() -> Option<PathBuf> {
+    dirs::config_dir().map(|d| d.join("medialinker"))
+}
+
 fn config_path() -> Option<PathBuf> {
-    dirs::config_dir().map(|d| d.join("medialinker").join("server"))
+    config_dir().map(|d| d.join("server"))
 }
 
 fn normalize_server(url: &str) -> Result<String> {
@@ -304,48 +375,117 @@ fn quote(name: &str) -> String {
 /// The server can't check the size of encrypted text, so `ml` keeps to the same limit as plain text.
 const MAX_TEXT_BYTES: usize = 1024 * 1024;
 
-fn send(
-    server: &str,
-    input: Vec<String>,
-    text: bool,
-    name: Option<String>,
-    ttl: Ttl,
-    qr: bool,
-    encrypt: bool,
-) -> Result<()> {
-    let payload = payload(input, text, name)?;
-    let key = encrypt.then(SecretKey::generate).transpose()?;
-    let flag = if key.is_some() { "&encrypted=1" } else { "" };
-    let created = upload(server, &format!("ttl={}{flag}", ttl.as_str()), payload, key.as_ref())?;
+fn send(server: &str, a: SendArgs) -> Result<()> {
+    if a.ttl == Ttl::Never && !a.link {
+        return Err("--ttl never only works with --link: short codes need an end".into());
+    }
+    if a.burn && a.link {
+        return Err(
+            "--burn only works with short codes: link previews in chat apps would open a direct link first".into(),
+        );
+    }
+    if a.short && a.encrypt {
+        return Err("--short can't be used with --encrypt: is.gd would see the key in the link".into());
+    }
+    let payload = payload(a.input, a.text, a.name)?;
+    let key = a.encrypt.then(SecretKey::generate).transpose()?;
+    let mut query = format!("ttl={}", a.ttl.as_str());
+    if key.is_some() {
+        query.push_str("&encrypted=1");
+    }
+    if a.burn {
+        query.push_str("&burn=1");
+    }
+    let endpoint = if a.link { "upload" } else { "share" };
+    let created = upload(server, &format!("{endpoint}?{query}"), payload, key.as_ref()).map_err(|e| {
+        if a.link && key.is_none() && e.starts_with("Unsupported file type") {
+            format!("{e}: plain direct links only take images, audio, video and text; add -e or leave out --link")
+        } else {
+            e
+        }
+    })?;
     // The key only ever goes into what we print; the server got ciphertext.
     let secret = key.map(|k| k.encode());
-    match &secret {
-        Some(k) => println!("{}.{k}", created.code),
-        None => println!("{}", created.code),
-    }
-    if io::stderr().is_terminal() {
-        let link = match &secret {
-            Some(k) => format!("{server}/?code={}#k={k}", created.code),
-            None => format!("{server}/?code={}", created.code),
+    let unexpected = || "unexpected answer from server".to_string();
+    // What goes to stdout, and the page a phone should open.
+    let (mut out, mut link) = if a.link {
+        let url = match &secret {
+            Some(k) => format!("{server}/d/{}#k={k}", created.name.ok_or_else(unexpected)?),
+            None => created.url.ok_or_else(unexpected)?,
         };
-        show_link(&link, qr);
-        if secret.is_some() {
-            eprintln!("End-to-end encrypted: the code alone won't open it, pass on the link or CODE.KEY");
+        (url.clone(), url)
+    } else {
+        let code = created.code.ok_or_else(unexpected)?;
+        match &secret {
+            Some(k) => (format!("{code}.{k}"), format!("{server}/?code={code}#k={k}")),
+            None => (code.clone(), format!("{server}/?code={code}")),
         }
-        if let Some(expires_at) = created.expires_at {
-            eprintln!("Expires in {} ({})", ttl.as_str(), expiry(expires_at));
+    };
+    if a.short {
+        link = shorten(&link)?;
+        out = link.clone();
+    }
+    println!("{out}");
+    if io::stderr().is_terminal() {
+        if !a.no_qr
+            && let Some(code) = qr_code(&link)
+        {
+            eprint!("{code}");
+        }
+        if link != out {
+            eprintln!("Open {link}");
+        }
+        match (&secret, a.link) {
+            (Some(_), false) => {
+                eprintln!("End-to-end encrypted: the code alone won't open it, pass on the link or CODE.KEY")
+            }
+            (Some(_), true) => {
+                eprintln!("End-to-end encrypted: the key is in the link after #, which never reaches the server")
+            }
+            _ => {}
+        }
+        if a.burn {
+            eprintln!("Burns after reading: deleted the first time it's opened");
+        }
+        match created.expires_at {
+            Some(t) => eprintln!("Expires in {} ({})", a.ttl.as_str(), expiry(t)),
+            None => eprintln!("Never expires"),
         }
     }
     Ok(())
 }
 
+/// Turns a link into an is.gd short link, like the button on the site. Only called on request.
+fn shorten(link: &str) -> Result<String> {
+    #[derive(Deserialize)]
+    struct IsGd {
+        shorturl: Option<String>,
+        errormessage: Option<String>,
+    }
+    let mut res = agent()
+        .get("https://is.gd/create.php")
+        .query("format", "json")
+        .query("url", link)
+        .call()
+        .map_err(|e| format!("cannot reach is.gd: {e}"))?;
+    let body: IsGd = res
+        .body_mut()
+        .read_json()
+        .map_err(|e| format!("unexpected answer from is.gd: {e}"))?;
+    body.shorturl.ok_or_else(|| {
+        body.errormessage
+            .unwrap_or_else(|| "is.gd could not shorten that link".into())
+    })
+}
+
 /// Posts a public share, like "Post something" on the site's Public page.
 fn public(server: &str, input: Vec<String>, text: bool, name: Option<String>, qr: bool) -> Result<()> {
     let payload = payload(input, text, name)?;
-    let created = upload(server, "public=1", payload, None)?;
-    println!("{}", created.code);
+    let created = upload(server, "share?public=1", payload, None)?;
+    let code = created.code.ok_or("unexpected answer from server")?;
+    println!("{code}");
     if io::stderr().is_terminal() {
-        show_link(&format!("{server}/?code={}", created.code), qr);
+        show_link(&format!("{server}/?code={code}"), qr);
         eprintln!("Public: anyone can see, like and comment on it at {server}/public. It never expires.");
     }
     Ok(())
@@ -359,8 +499,8 @@ fn show_link(link: &str, qr: bool) {
     eprintln!("Open {link}");
 }
 
-/// Uploads a share to `/share?{query}` as multipart, encrypting it first if there is a key.
-fn upload(server: &str, query: &str, payload: Payload, key: Option<&SecretKey>) -> Result<Created> {
+/// Uploads to `{server}/{path}` (with its query) as multipart, encrypting first if there is a key.
+fn upload(server: &str, path: &str, payload: Payload, key: Option<&SecretKey>) -> Result<Created> {
     let boundary = format!("ml-{:016x}{:016x}", rand_u64(), rand_u64());
     if let Payload::Text(t) = &payload
         && t.trim().is_empty()
@@ -406,7 +546,7 @@ fn upload(server: &str, query: &str, payload: Payload, key: Option<&SecretKey>) 
         .chain(io::Cursor::new(format!("\r\n--{boundary}--\r\n")));
 
     let res = agent()
-        .post(format!("{server}/share?{query}"))
+        .post(format!("{server}/{path}"))
         .header("Content-Type", format!("multipart/form-data; boundary={boundary}"))
         .send(SendBody::from_reader(&mut multipart))
         .map_err(net_err(server))?;
@@ -426,12 +566,15 @@ fn encrypted_head() -> String {
 /// What `ml get` was pointed at: a code, `CODE.KEY`, or a web page link with the key in its fragment.
 struct Target {
     server: Option<String>,
+    /// Empty for a direct link.
     code: String,
     key: Option<SecretKey>,
+    /// The file name of a direct link (`/f/NAME`, or `/d/NAME` for an encrypted one).
+    file: Option<String>,
 }
 
 impl Target {
-    fn parse(input: &str, key: Option<String>) -> Result<Self> {
+    fn parse(input: &str, key_flag: Option<String>) -> Result<Self> {
         let input = input.trim();
         let (server, code, from_input) = if input.starts_with("http://") || input.starts_with("https://") {
             let (rest, fragment) = input.split_once('#').unwrap_or((input, ""));
@@ -439,12 +582,25 @@ impl Target {
             let host_end = rest[scheme_end..]
                 .find(['/', '?'])
                 .map_or(rest.len(), |i| scheme_end + i);
+            let server = Some(rest[..host_end].to_string());
+            let key = fragment.strip_prefix("k=").filter(|k| !k.is_empty());
+            let path = rest[host_end..].split('?').next().unwrap_or_default();
+            if let Some(file) = path.strip_prefix("/f/").or_else(|| path.strip_prefix("/d/")) {
+                if file.is_empty() || file.contains(['/', '\\']) || file.starts_with('.') {
+                    return Err("that link has no file name in it".into());
+                }
+                return Ok(Self {
+                    server,
+                    code: String::new(),
+                    key: parse_key(key_flag.as_deref().or(key))?,
+                    file: Some(file.to_string()),
+                });
+            }
             let code = rest[host_end..]
                 .split_once('?')
                 .and_then(|(_, q)| q.split('&').find_map(|p| p.strip_prefix("code=")))
                 .ok_or("that link has no share code in it")?;
-            let key = fragment.strip_prefix("k=").filter(|k| !k.is_empty());
-            (Some(rest[..host_end].to_string()), code, key)
+            (server, code, key)
         } else {
             match input.split_once('.') {
                 Some((code, key)) => (None, code, Some(key)),
@@ -455,12 +611,18 @@ impl Target {
         if code.len() != 5 || !code.bytes().all(|b| b.is_ascii_alphanumeric()) {
             return Err(format!("{code:?} is not a share code (codes are 5 letters and digits)"));
         }
-        let key = match key.as_deref().or(from_input) {
-            Some(k) => Some(SecretKey::parse(k).ok_or("that key is not valid (it should be 43 characters)")?),
-            None => None,
-        };
-        Ok(Self { server, code, key })
+        Ok(Self {
+            server,
+            code,
+            key: parse_key(key_flag.as_deref().or(from_input))?,
+            file: None,
+        })
     }
+}
+
+fn parse_key(key: Option<&str>) -> Result<Option<SecretKey>> {
+    key.map(|k| SecretKey::parse(k).ok_or_else(|| "that key is not valid (it should be 43 characters)".to_string()))
+        .transpose()
 }
 
 /// Renders `link` as a QR code in half-block characters, dark on light so it scans on any terminal theme.
@@ -475,6 +637,9 @@ fn qr_code(link: &str) -> Option<String> {
 
 fn get(server: &str, target: &Target, output: Option<PathBuf>, force: bool) -> Result<()> {
     let agent = agent();
+    if let Some(file) = &target.file {
+        return get_direct(&agent, server, file, target.key.as_ref(), output, force);
+    }
     let share: Share = check(
         agent
             .get(format!("{server}/share/{}", target.code))
@@ -484,38 +649,94 @@ fn get(server: &str, target: &Target, output: Option<PathBuf>, force: bool) -> R
     .body_mut()
     .read_json()
     .map_err(|e| format!("unexpected answer from server: {e}"))?;
+    let file_url = format!("{server}/s/{}/file?download=1", share.code);
 
     if share.encrypted {
         let key = target
             .key
             .as_ref()
             .ok_or("this share is end-to-end encrypted: pass the link or CODE.KEY you were given, or --key KEY")?;
-        return get_encrypted(&agent, server, &share, key, output, force);
+        get_encrypted(&agent, server, &file_url, key, output, force)?;
+    } else if share.kind == "text" {
+        print_text(share.text.clone().unwrap_or_default(), output, force)?;
+    } else {
+        let mut res = check(agent.get(&file_url).call().map_err(net_err(server))?)?;
+        let name = safe_name(share.name.as_deref());
+        save(&mut res.body_mut().as_reader(), output, force, &name, Some(share.size))?;
     }
-
-    if share.kind == "text" {
-        let text = share.text.unwrap_or_default();
-        return print_text(text, output, force);
+    if io::stderr().is_terminal() {
+        if share.burn {
+            eprintln!("Burned after reading: it's gone from the server now");
+        }
+        if share.public {
+            eprintln!(
+                "Public · {} · {} · ml comments {}",
+                plural(share.likes, "like"),
+                plural(share.comments, "comment"),
+                share.code
+            );
+        }
     }
+    Ok(())
+}
 
-    let mut res = check(
-        agent
-            .get(format!("{server}/s/{}/file?download=1", share.code))
-            .call()
-            .map_err(net_err(server))?,
-    )?;
-    let mut body = res.body_mut().as_reader();
+/// Fetches a direct link: plain ones are saved as they are, `/d/` ones are decrypted with the key.
+fn get_direct(
+    agent: &Agent,
+    server: &str,
+    file: &str,
+    key: Option<&SecretKey>,
+    output: Option<PathBuf>,
+    force: bool,
+) -> Result<()> {
+    let url = format!("{server}/f/{file}");
+    if let Some(key) = key {
+        return get_encrypted(agent, server, &url, key, output, force);
+    }
+    if file.ends_with(".mle") {
+        return Err("this link is end-to-end encrypted: pass the whole link with its #k= key, or --key KEY".into());
+    }
+    let res = agent.get(&url).call().map_err(net_err(server))?;
+    if res.status() == 404 {
+        return Err("no file at that link (it may have expired)".into());
+    }
+    let mut res = check(res)?;
+    save(
+        &mut res.body_mut().as_reader(),
+        output,
+        force,
+        &link_file_name(file),
+        None,
+    )
+}
+
+/// The name to save a direct link's file under: its random ID and extension, minus the expiry.
+fn link_file_name(file: &str) -> String {
+    let name = match file.split_once(".x") {
+        Some((id, rest)) => {
+            let ext = rest.trim_start_matches(|c: char| c.is_ascii_digit());
+            format!("{id}{ext}")
+        }
+        None => file.to_string(),
+    };
+    safe_name(Some(&name))
+}
+
+/// Writes a download to stdout (`-o -`) or a new file, checking its size when it is known.
+fn save(body: &mut dyn Read, output: Option<PathBuf>, force: bool, name: &str, size: Option<u64>) -> Result<()> {
     if output.as_deref() == Some(Path::new("-")) {
-        io::copy(&mut body, &mut io::stdout().lock()).map_err(|e| format!("download failed: {e}"))?;
+        io::copy(body, &mut io::stdout().lock()).map_err(|e| format!("download failed: {e}"))?;
         return Ok(());
     }
-    let path = output.unwrap_or_else(|| PathBuf::from(safe_name(share.name.as_deref())));
-    let size = write_new(&path, force, &mut body)?;
-    if size != share.size {
+    let path = output.unwrap_or_else(|| PathBuf::from(name));
+    let got = write_new(&path, force, body)?;
+    if let Some(size) = size
+        && got != size
+    {
         let _ = fs::remove_file(&path);
-        return Err(format!("download incomplete ({size} of {} bytes)", share.size));
+        return Err(format!("download incomplete ({got} of {size} bytes)"));
     }
-    eprintln!("Saved {} ({})", path.display(), human_size(size));
+    eprintln!("Saved {} ({})", path.display(), human_size(got));
     Ok(())
 }
 
@@ -523,17 +744,12 @@ fn get(server: &str, target: &Target, output: Option<PathBuf>, force: bool) -> R
 fn get_encrypted(
     agent: &Agent,
     server: &str,
-    share: &Share,
+    url: &str,
     key: &SecretKey,
     output: Option<PathBuf>,
     force: bool,
 ) -> Result<()> {
-    let res = check(
-        agent
-            .get(format!("{server}/s/{}/file?download=1", share.code))
-            .call()
-            .map_err(net_err(server))?,
-    )?;
+    let res = check(agent.get(url).call().map_err(net_err(server))?)?;
     let (header, mut plain) =
         Decryptor::open(key, Box::new(res.into_body().into_reader())).map_err(|e| format!("cannot decrypt: {e}"))?;
 
@@ -562,6 +778,15 @@ fn get_encrypted(
     let size = write_new(&path, force, &mut plain)?;
     eprintln!("Saved {} ({}, decrypted)", path.display(), human_size(size));
     Ok(())
+}
+
+/// "1 like", "3 likes".
+fn plural(n: u64, word: &str) -> String {
+    if n == 1 {
+        format!("1 {word}")
+    } else {
+        format!("{n} {word}s")
+    }
 }
 
 fn print_text(text: String, output: Option<PathBuf>, force: bool) -> Result<()> {
@@ -689,7 +914,18 @@ mod tests {
         let mut out = Vec::new();
         clap_complete::generate(Shell::Bash, &mut Cli::command(), "ml", &mut out);
         let script = String::from_utf8(out).unwrap();
-        for sub in ["send", "public", "get", "clip", "sync", "server", "completions"] {
+        for sub in [
+            "send",
+            "public",
+            "browse",
+            "comments",
+            "like",
+            "get",
+            "clip",
+            "sync",
+            "server",
+            "completions",
+        ] {
             assert!(script.contains(sub), "{sub} missing");
         }
     }
@@ -712,7 +948,26 @@ mod tests {
         let t = Target::parse("https://m.example.com/?code=K7QX2", Some(key.clone())).unwrap();
         assert_eq!(t.key.unwrap().encode(), key);
         assert!(Target::parse("K7QX2.nope", None).is_err());
+
+        let t = Target::parse("https://m.example.com/f/AbC12.x1794999763.png", None).unwrap();
+        assert_eq!(t.file.as_deref(), Some("AbC12.x1794999763.png"));
+        assert_eq!(t.server.as_deref(), Some("https://m.example.com"));
+        let t = Target::parse(&format!("http://localhost:3000/d/AbC12.mle#k={key}"), None).unwrap();
+        assert_eq!(
+            (t.file.as_deref(), t.key.unwrap().encode()),
+            (Some("AbC12.mle"), key.clone())
+        );
+        assert!(Target::parse("https://m.example.com/f/", None).is_err());
+        assert!(Target::parse("https://m.example.com/f/../x", None).is_err());
         assert!(Target::parse("https://m.example.com/", None).is_err());
+    }
+
+    #[test]
+    fn direct_link_files_lose_their_expiry() {
+        assert_eq!(link_file_name("AbC12.x1794999763.png"), "AbC12.png");
+        assert_eq!(link_file_name("AbC12.txt"), "AbC12.txt");
+        assert_eq!(plural(1, "like"), "1 like");
+        assert_eq!(plural(0, "like"), "0 likes");
     }
 
     #[test]
