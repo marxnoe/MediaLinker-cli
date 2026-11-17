@@ -1,7 +1,9 @@
 # MediaLinker-cli
 
 `ml` shares files and text through a [MediaLinker](https://github.com/marxnoe/MediaLinker)
-server. Every share gets a 5-character code that works until it expires.
+server. Every share gets a 5-character code that works until it expires. It does everything the
+site does: short codes, direct links, burn after reading, end-to-end encryption, public shares with
+likes and comments, and a shared clipboard.
 
 ## Install
 
@@ -46,12 +48,25 @@ ml send notes.txt --text     # share the words "notes.txt", not the file
 cat log.txt | ml send        # share stdin as text
 tar cz dir | ml send -n dir.tgz   # share stdin as a file
 ml send video.mp4 --ttl 7d   # expiry: 1h, 24h (default) or 7d
+ml send -b "the wifi password"   # burn after reading: deleted the first time it's opened
+ml send -l cat.png           # a direct link instead of a code
+ml send -l clip.mp4 --ttl never  # direct links can last for good
+ml send --short report.pdf   # print an is.gd short link instead of the code
 
 ml get K7QX2                 # prints text, or saves a file in the current directory
 ml get K7QX2 -o out.jpg      # save under another name (-o - writes to stdout)
+ml get https://…/f/AbC12.png # direct links work too
 ```
 
 `ml get` never overwrites an existing file unless you pass `--force`.
+
+A burning share (`--burn`) is deleted the first time someone opens its text or downloads its file,
+so only one person ever gets it. It works for short codes only: chat apps' link previews would open
+a direct link before the real person does.
+
+Plain direct links (`--link`) take images, audio, video and text; with `-e` any file works and the
+link opens a page that decrypts it. `--short` asks is.gd for a short link, only when you pass it,
+and never for encrypted shares, whose key is in the link.
 
 ## Public shares
 
@@ -67,6 +82,18 @@ ml public -n song.mp3 < a.mp3   # post stdin as a file
 
 Anyone can see, like and comment on a public post. It never expires and isn't encrypted, so there is
 no `--ttl` or `--encrypt`; don't post anything private.
+
+```sh
+ml browse                    # most liked public shares, 20 at a time (--page 2 for more)
+ml browse --new cats         # newest first, only ones mentioning "cats"
+ml get K7QX2                 # open one
+ml comments K7QX2            # read its comments
+ml comments K7QX2 "nice"     # post one; --name NAME, or NAME#secret for a tripcode
+ml like K7QX2                # like it (--undo takes it back)
+```
+
+Likes count once per machine, the way the site counts once per browser: `ml` keeps a random ID
+in its config directory. Nothing else identifies you.
 
 In a terminal, `ml send` also prints a QR code and a link to the receive page, so a phone can open the
 share straight away. `--no-qr` leaves the QR code out; nothing extra is printed when stderr is not a
