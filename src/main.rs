@@ -118,7 +118,8 @@ struct SendArgs {
     /// Don't print a QR code
     #[arg(long)]
     no_qr: bool,
-    /// Encrypt before uploading, so the server never sees the content; prints CODE.KEY
+    /// Encrypt before uploading, so the server never sees the content; makes a direct link with
+    /// the key after # (implies --link, short codes aren't encrypted)
     #[arg(long, short)]
     encrypt: bool,
     /// Burn after reading: deleted the first time it's opened (short codes only)
@@ -416,10 +417,17 @@ fn quote(name: &str) -> String {
 const MAX_TEXT_BYTES: usize = 1024 * 1024;
 
 fn send(server: &str, a: SendArgs) -> Result<()> {
-    if a.ttl.is_never() && !a.link {
+    // End-to-end encryption is only for direct links.
+    let as_link = a.link || a.encrypt;
+    if a.burn && a.encrypt {
+        return Err(
+            "--burn can't be used with --encrypt: encrypted shares are direct links, and only short codes burn".into(),
+        );
+    }
+    if a.ttl.is_never() && !as_link {
         return Err("--ttl never only works with --link: short codes need an end".into());
     }
-    if a.burn && a.link {
+    if a.burn && as_link {
         return Err(
             "--burn only works with short codes: link previews in chat apps would open a direct link first".into(),
         );
@@ -436,9 +444,9 @@ fn send(server: &str, a: SendArgs) -> Result<()> {
     if a.burn {
         query.push_str("&burn=1");
     }
-    let endpoint = if a.link { "upload" } else { "share" };
+    let endpoint = if as_link { "upload" } else { "share" };
     let created = upload(server, &format!("{endpoint}?{query}"), payload, key.as_ref()).map_err(|e| {
-        if a.link && key.is_none() && e.starts_with("Unsupported file type") {
+        if as_link && key.is_none() && e.starts_with("Unsupported file type") {
             format!("{e}: plain direct links only take images, audio, video and text; add -e or leave out --link")
         } else {
             e
@@ -448,7 +456,7 @@ fn send(server: &str, a: SendArgs) -> Result<()> {
     let secret = key.map(|k| k.encode());
     let unexpected = || "unexpected answer from server".to_string();
     // What goes to stdout, and the page a phone should open.
-    let (mut out, mut link) = if a.link {
+    let (mut out, mut link) = if as_link {
         let url = match &secret {
             Some(k) => format!("{server}/d/{}#k={k}", created.name.ok_or_else(unexpected)?),
             None => created.url.ok_or_else(unexpected)?,
@@ -456,10 +464,7 @@ fn send(server: &str, a: SendArgs) -> Result<()> {
         (url.clone(), url)
     } else {
         let code = created.code.ok_or_else(unexpected)?;
-        match &secret {
-            Some(k) => (format!("{code}.{k}"), format!("{server}/?code={code}#k={k}")),
-            None => (code.clone(), format!("{server}/?code={code}")),
-        }
+        (code.clone(), format!("{server}/?code={code}"))
     };
     if a.short {
         link = shorten(&link)?;
@@ -475,14 +480,8 @@ fn send(server: &str, a: SendArgs) -> Result<()> {
         if link != out {
             eprintln!("Open {link}");
         }
-        match (&secret, a.link) {
-            (Some(_), false) => {
-                eprintln!("End-to-end encrypted: the code alone won't open it, pass on the link or CODE.KEY")
-            }
-            (Some(_), true) => {
-                eprintln!("End-to-end encrypted: the key is in the link after #, which never reaches the server")
-            }
-            _ => {}
+        if secret.is_some() {
+            eprintln!("End-to-end encrypted: the key is in the link after #, which never reaches the server");
         }
         if a.burn {
             eprintln!("Burns after reading: deleted the first time it's opened");
