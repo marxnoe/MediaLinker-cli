@@ -102,20 +102,21 @@ terminal, so `CODE=$(ml send file)` stays clean.
 
 ## End-to-end encryption
 
-Encryption is off unless you ask for it. With `--encrypt` (`-e`), `ml` encrypts the share locally
-with AES-256-GCM and a fresh key before uploading, so the server stores only ciphertext and never
-sees the key, the file name or whether it is text. `ml send -e` prints `CODE.KEY` instead of the
-bare code, and its link and QR code carry the key after the `#`, which browsers never send.
+Encryption is off unless you ask for it, and it's for direct links only. With `--encrypt` (`-e`),
+`ml` encrypts the file or text locally with AES-256-GCM and a fresh key before uploading, so the
+server stores only ciphertext and never sees the key, the file name or whether it is text. `-e`
+makes a direct link (it implies `--link`); its link and QR code carry the key after the `#`, which
+browsers never send.
 
 ```sh
-ml send -e taxes.pdf                       # prints K7QX2.3q9Vh…
-ml get K7QX2.3q9Vh…                        # decrypt with the key
-ml get 'https://…/?code=K7QX2#k=3q9Vh…'    # or the whole link from the web page
-ml get K7QX2 --key 3q9Vh…                  # or the key on its own
+ml send -e taxes.pdf                  # prints https://…/d/AbC12.x….mle#k=3q9Vh…
+ml get 'https://…/d/AbC12…#k=3q9Vh…'  # download and decrypt
+ml get 'https://…/d/AbC12…' --key 3q9Vh…   # or the key on its own
 ```
 
-Shares encrypted on the web page open with `ml get`, and the other way round. The code alone can't
-open an encrypted share.
+Links encrypted on the web page open with `ml get`, and the other way round. Short codes aren't
+encrypted; encrypted short codes made before this change (`CODE.KEY`) still open with `ml get`
+until they expire.
 
 ## Shared clipboard
 
