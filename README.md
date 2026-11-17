@@ -53,6 +53,21 @@ ml get K7QX2 -o out.jpg      # save under another name (-o - writes to stdout)
 
 `ml get` never overwrites an existing file unless you pass `--force`.
 
+## Public shares
+
+`ml public` posts a file or some text to the server's Public page, like *Post something* there.
+It reads files, text and stdin the same way as `ml send` and prints the code.
+
+```sh
+ml public meme.png           # post a file
+ml public "hello everyone"   # post some text
+fortune | ml public          # post stdin as text
+ml public -n song.mp3 < a.mp3   # post stdin as a file
+```
+
+Anyone can see, like and comment on a public post. It never expires and isn't encrypted, so there is
+no `--ttl` or `--encrypt`; don't post anything private.
+
 In a terminal, `ml send` also prints a QR code and a link to the receive page, so a phone can open the
 share straight away. `--no-qr` leaves the QR code out; nothing extra is printed when stderr is not a
 terminal, so `CODE=$(ml send file)` stays clean.

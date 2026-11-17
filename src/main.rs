@@ -50,6 +50,20 @@ enum Command {
         #[arg(long, short)]
         encrypt: bool,
     },
+    /// Post a file or some text publicly: listed on the Public page for everyone, and never expires
+    Public {
+        /// A file path, some text, or `-` to read stdin (stdin is also read when nothing is given)
+        input: Vec<String>,
+        /// Post the input as text even if it names a file
+        #[arg(long, short)]
+        text: bool,
+        /// Post stdin as a file with this name instead of as text
+        #[arg(long, short, value_name = "NAME")]
+        name: Option<String>,
+        /// Don't print a QR code for the share's page
+        #[arg(long)]
+        no_qr: bool,
+    },
     /// Fetch a share: print text, or download a file into the current directory
     Get {
         /// The code, CODE.KEY for an encrypted share, or a link from the web page
@@ -99,7 +113,8 @@ impl Ttl {
 #[serde(rename_all = "camelCase")]
 struct Created {
     code: String,
-    expires_at: u64,
+    /// `null` for public shares, which never expire.
+    expires_at: Option<u64>,
 }
 
 #[derive(Deserialize)]
@@ -147,6 +162,12 @@ fn run(cli: Cli) -> Result<()> {
             no_qr,
             encrypt,
         } => send(&server(cli.server)?, input, text, name, ttl, !no_qr, encrypt),
+        Command::Public {
+            input,
+            text,
+            name,
+            no_qr,
+        } => public(&server(cli.server)?, input, text, name, !no_qr),
         Command::Get {
             code,
             key,
@@ -292,15 +313,61 @@ fn send(
     qr: bool,
     encrypt: bool,
 ) -> Result<()> {
-    let boundary = format!("ml-{:016x}{:016x}", rand_u64(), rand_u64());
     let payload = payload(input, text, name)?;
+    let key = encrypt.then(SecretKey::generate).transpose()?;
+    let flag = if key.is_some() { "&encrypted=1" } else { "" };
+    let created = upload(server, &format!("ttl={}{flag}", ttl.as_str()), payload, key.as_ref())?;
+    // The key only ever goes into what we print; the server got ciphertext.
+    let secret = key.map(|k| k.encode());
+    match &secret {
+        Some(k) => println!("{}.{k}", created.code),
+        None => println!("{}", created.code),
+    }
+    if io::stderr().is_terminal() {
+        let link = match &secret {
+            Some(k) => format!("{server}/?code={}#k={k}", created.code),
+            None => format!("{server}/?code={}", created.code),
+        };
+        show_link(&link, qr);
+        if secret.is_some() {
+            eprintln!("End-to-end encrypted: the code alone won't open it, pass on the link or CODE.KEY");
+        }
+        if let Some(expires_at) = created.expires_at {
+            eprintln!("Expires in {} ({})", ttl.as_str(), expiry(expires_at));
+        }
+    }
+    Ok(())
+}
+
+/// Posts a public share, like "Post something" on the site's Public page.
+fn public(server: &str, input: Vec<String>, text: bool, name: Option<String>, qr: bool) -> Result<()> {
+    let payload = payload(input, text, name)?;
+    let created = upload(server, "public=1", payload, None)?;
+    println!("{}", created.code);
+    if io::stderr().is_terminal() {
+        show_link(&format!("{server}/?code={}", created.code), qr);
+        eprintln!("Public: anyone can see, like and comment on it at {server}/public. It never expires.");
+    }
+    Ok(())
+}
+
+/// Prints the QR code (if asked) and the link to a share's page.
+fn show_link(link: &str, qr: bool) {
+    if qr && let Some(code) = qr_code(link) {
+        eprint!("{code}");
+    }
+    eprintln!("Open {link}");
+}
+
+/// Uploads a share to `/share?{query}` as multipart, encrypting it first if there is a key.
+fn upload(server: &str, query: &str, payload: Payload, key: Option<&SecretKey>) -> Result<Created> {
+    let boundary = format!("ml-{:016x}{:016x}", rand_u64(), rand_u64());
     if let Payload::Text(t) = &payload
         && t.trim().is_empty()
     {
         return Err("text is empty".into());
     }
-    let key = encrypt.then(SecretKey::generate).transpose()?;
-    let (head, body): (String, Box<dyn Read>) = match (payload, &key) {
+    let (head, body): (String, Box<dyn Read>) = match (payload, key) {
         (Payload::Text(t), Some(key)) => {
             if t.len() > MAX_TEXT_BYTES {
                 return Err("text exceeds the 1 MB limit".into());
@@ -338,37 +405,15 @@ fn send(
         .chain(body)
         .chain(io::Cursor::new(format!("\r\n--{boundary}--\r\n")));
 
-    let flag = if key.is_some() { "&encrypted=1" } else { "" };
     let res = agent()
-        .post(format!("{server}/share?ttl={}{flag}", ttl.as_str()))
+        .post(format!("{server}/share?{query}"))
         .header("Content-Type", format!("multipart/form-data; boundary={boundary}"))
         .send(SendBody::from_reader(&mut multipart))
         .map_err(net_err(server))?;
-    let created: Created = check(res)?
+    check(res)?
         .body_mut()
         .read_json()
-        .map_err(|e| format!("unexpected answer from server: {e}"))?;
-    // The key only ever goes into what we print; the server got ciphertext.
-    let secret = key.map(|k| k.encode());
-    match &secret {
-        Some(k) => println!("{}.{k}", created.code),
-        None => println!("{}", created.code),
-    }
-    if io::stderr().is_terminal() {
-        let link = match &secret {
-            Some(k) => format!("{server}/?code={}#k={k}", created.code),
-            None => format!("{server}/?code={}", created.code),
-        };
-        if qr && let Some(code) = qr_code(&link) {
-            eprint!("{code}");
-        }
-        eprintln!("Open {link}");
-        if secret.is_some() {
-            eprintln!("End-to-end encrypted: the code alone won't open it, pass on the link or CODE.KEY");
-        }
-        eprintln!("Expires in {} ({})", ttl.as_str(), expiry(created.expires_at));
-    }
-    Ok(())
+        .map_err(|e| format!("unexpected answer from server: {e}"))
 }
 
 /// Encrypted shares are always an opaque file; the real name and kind are inside the ciphertext.
@@ -644,7 +689,7 @@ mod tests {
         let mut out = Vec::new();
         clap_complete::generate(Shell::Bash, &mut Cli::command(), "ml", &mut out);
         let script = String::from_utf8(out).unwrap();
-        for sub in ["send", "get", "clip", "sync", "server", "completions"] {
+        for sub in ["send", "public", "get", "clip", "sync", "server", "completions"] {
             assert!(script.contains(sub), "{sub} missing");
         }
     }
