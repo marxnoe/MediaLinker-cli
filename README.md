@@ -48,6 +48,7 @@ ml send notes.txt --text     # share the words "notes.txt", not the file
 cat log.txt | ml send        # share stdin as text
 tar cz dir | ml send -n dir.tgz   # share stdin as a file
 ml send video.mp4 --ttl 7d   # expiry: 1h, 24h (default) or 7d
+ml send notes.txt --ttl 1d12h    # or your own: 5 minutes to 30 days (s, m, h, d, w)
 ml send -b "the wifi password"   # burn after reading: deleted the first time it's opened
 ml send -l cat.png           # a direct link instead of a code
 ml send -l clip.mp4 --ttl never  # direct links can last for good

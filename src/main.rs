@@ -12,7 +12,7 @@ use std::{
     process::ExitCode,
 };
 
-use clap::{Args, CommandFactory, Parser, Subcommand, ValueEnum};
+use clap::{Args, CommandFactory, Parser, Subcommand};
 use clap_complete::Shell;
 use e2e::{Decryptor, Encryptor, Header, SecretKey};
 use qrcode::{QrCode, render::unicode::Dense1x2};
@@ -111,8 +111,9 @@ struct SendArgs {
     /// Send stdin as a file with this name instead of as text
     #[arg(long, short, value_name = "NAME")]
     name: Option<String>,
-    /// How long the share lives (`never` only with --link)
-    #[arg(long, value_enum, default_value_t = Ttl::Day)]
+    /// How long the share lives: 1h, 24h, 7d, or your own like 90m or 1d12h (5 minutes to 30 days
+    /// for codes; links can go longer, or `never`)
+    #[arg(long, default_value = "24h", value_parser = Ttl::parse)]
     ttl: Ttl,
     /// Don't print a QR code
     #[arg(long)]
@@ -131,25 +132,64 @@ struct SendArgs {
     short: bool,
 }
 
-#[derive(Clone, Copy, PartialEq, ValueEnum)]
-enum Ttl {
-    #[value(name = "1h")]
-    Hour,
-    #[value(name = "24h")]
-    Day,
-    #[value(name = "7d")]
-    Week,
-    #[value(name = "never")]
-    Never,
+/// How long a share lives, as typed, and what to send the server for it.
+#[derive(Clone)]
+struct Ttl {
+    shown: String,
+    /// `never`, or a number of seconds.
+    secs: Option<u64>,
 }
 
 impl Ttl {
-    fn as_str(self) -> &'static str {
-        match self {
-            Ttl::Hour => "1h",
-            Ttl::Day => "24h",
-            Ttl::Week => "7d",
-            Ttl::Never => "never",
+    /// `never`, or a duration of whole numbers with units, like `90m`, `36h` or `1d12h`.
+    fn parse(input: &str) -> Result<Self> {
+        let shown = input.trim().to_ascii_lowercase();
+        if shown == "never" {
+            return Ok(Self { shown, secs: None });
+        }
+        let bad = || format!("{input:?} is not an expiry: use 1h, 24h, 7d, never, or a duration like 90m or 1d12h");
+        let (mut secs, mut n) = (0u64, String::new());
+        for c in shown.chars() {
+            if c.is_ascii_digit() {
+                n.push(c);
+                continue;
+            }
+            let unit = match c {
+                's' => 1,
+                'm' => 60,
+                'h' => 3600,
+                'd' => 86_400,
+                'w' => 7 * 86_400,
+                _ => return Err(bad()),
+            };
+            let part = n
+                .parse::<u64>()
+                .ok()
+                .and_then(|n| n.checked_mul(unit))
+                .ok_or_else(bad)?;
+            secs = secs.checked_add(part).ok_or_else(bad)?;
+            n.clear();
+        }
+        if !n.is_empty() || secs == 0 {
+            return Err(bad());
+        }
+        Ok(Self {
+            shown,
+            secs: Some(secs),
+        })
+    }
+
+    fn is_never(&self) -> bool {
+        self.secs.is_none()
+    }
+
+    /// Presets go by name, so they work on servers from before custom expiries; anything else
+    /// goes as seconds.
+    fn query(&self) -> String {
+        match self.secs {
+            _ if ["1h", "24h", "7d"].contains(&self.shown.as_str()) => self.shown.clone(),
+            Some(s) => format!("{s}s"),
+            None => "never".into(),
         }
     }
 }
@@ -376,7 +416,7 @@ fn quote(name: &str) -> String {
 const MAX_TEXT_BYTES: usize = 1024 * 1024;
 
 fn send(server: &str, a: SendArgs) -> Result<()> {
-    if a.ttl == Ttl::Never && !a.link {
+    if a.ttl.is_never() && !a.link {
         return Err("--ttl never only works with --link: short codes need an end".into());
     }
     if a.burn && a.link {
@@ -389,7 +429,7 @@ fn send(server: &str, a: SendArgs) -> Result<()> {
     }
     let payload = payload(a.input, a.text, a.name)?;
     let key = a.encrypt.then(SecretKey::generate).transpose()?;
-    let mut query = format!("ttl={}", a.ttl.as_str());
+    let mut query = format!("ttl={}", a.ttl.query());
     if key.is_some() {
         query.push_str("&encrypted=1");
     }
@@ -448,7 +488,7 @@ fn send(server: &str, a: SendArgs) -> Result<()> {
             eprintln!("Burns after reading: deleted the first time it's opened");
         }
         match created.expires_at {
-            Some(t) => eprintln!("Expires in {} ({})", a.ttl.as_str(), expiry(t)),
+            Some(t) => eprintln!("Expires in {} ({})", a.ttl.shown, expiry(t)),
             None => eprintln!("Never expires"),
         }
     }
@@ -960,6 +1000,23 @@ mod tests {
         assert!(Target::parse("https://m.example.com/f/", None).is_err());
         assert!(Target::parse("https://m.example.com/f/../x", None).is_err());
         assert!(Target::parse("https://m.example.com/", None).is_err());
+    }
+
+    #[test]
+    fn expiries_take_presets_and_durations() {
+        let secs = |s: &str| Ttl::parse(s).map(|t| t.secs);
+        assert_eq!(secs("24h"), Ok(Some(86_400)));
+        assert_eq!(secs("7d"), Ok(Some(7 * 86_400)));
+        assert_eq!(secs("90m"), Ok(Some(5400)));
+        assert_eq!(secs("1d12h"), Ok(Some(36 * 3600)));
+        assert_eq!(secs("2W"), Ok(Some(14 * 86_400)));
+        assert_eq!(secs("never"), Ok(None));
+        for bad in ["", "0m", "5", "5y", "h", "1.5h", "-5m", "99999999999999999999d"] {
+            assert!(Ttl::parse(bad).is_err(), "{bad}");
+        }
+        assert_eq!(Ttl::parse("1h").unwrap().query(), "1h");
+        assert_eq!(Ttl::parse("90m").unwrap().query(), "5400s");
+        assert_eq!(Ttl::parse("never").unwrap().query(), "never");
     }
 
     #[test]
