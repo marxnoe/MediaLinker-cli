@@ -34,6 +34,7 @@ enum Command {
     /// Share a file or some text and print its code
     Send(SendArgs),
     /// Post a file or some text publicly: listed on the Public page for everyone, and never expires
+    /// (public posts are separate from shares; open one with `ml view`)
     Public {
         /// A file path, some text, or `-` to read stdin (stdin is also read when nothing is given)
         input: Vec<String>,
@@ -43,7 +44,7 @@ enum Command {
         /// Post stdin as a file with this name instead of as text
         #[arg(long, short, value_name = "NAME")]
         name: Option<String>,
-        /// Don't print a QR code for the share's page
+        /// Don't print a QR code for the post's page
         #[arg(long)]
         no_qr: bool,
     },
@@ -61,9 +62,20 @@ enum Command {
         #[arg(long, short)]
         force: bool,
     },
-    /// List public shares, most liked first, like the Public page
+    /// Open a public post: print its text, or download its file into the current directory
+    View {
+        /// The post's ID, or its link
+        id: String,
+        /// Where to save a file (`-` writes it to stdout)
+        #[arg(long, short, value_name = "PATH")]
+        output: Option<PathBuf>,
+        /// Overwrite an existing file
+        #[arg(long, short)]
+        force: bool,
+    },
+    /// List public posts, most liked first, like the Public page
     Browse {
-        /// Only shares whose text or file name contains this
+        /// Only posts whose text or file name contains this
         search: Vec<String>,
         /// Newest first instead of most liked
         #[arg(long)]
@@ -72,20 +84,20 @@ enum Command {
         #[arg(long, default_value_t = 1, value_name = "N")]
         page: u32,
     },
-    /// Read the comments on a public share, or post one
+    /// Read the comments on a public post, or post one
     Comments {
-        /// The code of a public share, or its link
-        code: String,
+        /// The ID of a public post, or its link
+        id: String,
         /// Post this as a comment instead of reading them
         text: Vec<String>,
         /// The name to post under (Anonymous if not given); `name#secret` adds a tripcode
         #[arg(long, short, value_name = "NAME")]
         name: Option<String>,
     },
-    /// Like a public share (once per machine, like once per browser on the site)
+    /// Like a public post (once per machine, like once per browser on the site)
     Like {
-        /// The code of a public share, or its link
-        code: String,
+        /// The ID of a public post, or its link
+        id: String,
         /// Take the like back
         #[arg(long)]
         undo: bool,
@@ -195,14 +207,16 @@ impl Ttl {
     }
 }
 
-/// What the server answers to an upload: a code for shares, a URL and file name for direct links.
+/// What the server answers to an upload: a code for shares, a URL and file name for direct links,
+/// an ID and page URL for public posts.
 #[derive(Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct Created {
     code: Option<String>,
+    id: Option<String>,
     url: Option<String>,
     name: Option<String>,
-    /// `null` for public shares and direct links that never expire.
+    /// `null` for direct links that never expire.
     expires_at: Option<u64>,
 }
 
@@ -218,12 +232,6 @@ struct Share {
     encrypted: bool,
     #[serde(default)]
     burn: bool,
-    #[serde(default)]
-    public: bool,
-    #[serde(default)]
-    likes: u64,
-    #[serde(default)]
-    comments: u64,
 }
 
 #[derive(Deserialize)]
@@ -269,14 +277,18 @@ fn run(cli: Cli) -> Result<()> {
             let server = server(cli.server.or(target.server.clone()))?;
             get(&server, &target, output, force)
         }
-        Command::Browse { search, new, page } => public::browse(&server(cli.server)?, &search.join(" "), new, page),
-        Command::Comments { code, text, name } => {
-            let (server, code) = public_code(cli.server, &code)?;
-            public::comments(&server, &code, &text.join(" "), name)
+        Command::View { id, output, force } => {
+            let post = public::PostRef::parse(&id)?;
+            public::view(&server(cli.server.or(post.server))?, &post.id, output, force)
         }
-        Command::Like { code, undo } => {
-            let (server, code) = public_code(cli.server, &code)?;
-            public::like(&server, &code, undo)
+        Command::Browse { search, new, page } => public::browse(&server(cli.server)?, &search.join(" "), new, page),
+        Command::Comments { id, text, name } => {
+            let post = public::PostRef::parse(&id)?;
+            public::comments(&server(cli.server.or(post.server))?, &post.id, &text.join(" "), name)
+        }
+        Command::Like { id, undo } => {
+            let post = public::PostRef::parse(&id)?;
+            public::like(&server(cli.server.or(post.server))?, &post.id, undo)
         }
         Command::Clip { command } => clip::run(command, server(cli.server)),
         Command::Completions { shell } => {
@@ -284,15 +296,6 @@ fn run(cli: Cli) -> Result<()> {
             Ok(())
         }
     }
-}
-
-/// The server and code a public share command was pointed at, from a code or a link.
-fn public_code(flag: Option<String>, input: &str) -> Result<(String, String)> {
-    let target = Target::parse(input, None)?;
-    if target.file.is_some() {
-        return Err("that's a direct link, not a public share".into());
-    }
-    Ok((server(flag.or(target.server))?, target.code))
 }
 
 fn config_dir() -> Option<PathBuf> {
@@ -517,20 +520,27 @@ fn shorten(link: &str) -> Result<String> {
     })
 }
 
-/// Posts a public share, like "Post something" on the site's Public page.
+/// Posts publicly, like "Post something" on the site's Public page. Public posts aren't shares:
+/// they have their own ID and page.
 fn public(server: &str, input: Vec<String>, text: bool, name: Option<String>, qr: bool) -> Result<()> {
     let payload = payload(input, text, name)?;
-    let created = upload(server, "share?public=1", payload, None)?;
-    let code = created.code.ok_or("unexpected answer from server")?;
-    println!("{code}");
+    let created = upload(server, "public", payload, None).map_err(|e| {
+        if e.ends_with(" 405 Method Not Allowed") {
+            format!("{server} is older than this ml and takes public posts only from ml 0.9 or older")
+        } else {
+            e
+        }
+    })?;
+    let id = created.id.ok_or("unexpected answer from server")?;
+    println!("{id}");
     if io::stderr().is_terminal() {
-        show_link(&format!("{server}/?code={code}"), qr);
-        eprintln!("Public: anyone can see, like and comment on it at {server}/public. It never expires.");
+        show_link(&created.url.unwrap_or_else(|| format!("{server}/p/{id}")), qr);
+        eprintln!("Public: anyone can see, like and comment on it. It never expires.");
     }
     Ok(())
 }
 
-/// Prints the QR code (if asked) and the link to a share's page.
+/// Prints the QR code (if asked) and the link to a page.
 fn show_link(link: &str, qr: bool) {
     if qr && let Some(code) = qr_code(link) {
         eprint!("{code}");
@@ -624,6 +634,9 @@ impl Target {
             let server = Some(rest[..host_end].to_string());
             let key = fragment.strip_prefix("k=").filter(|k| !k.is_empty());
             let path = rest[host_end..].split('?').next().unwrap_or_default();
+            if path.starts_with("/p/") || path.starts_with("/public/") {
+                return Err("that's a public post, not a share: open it with ml view".into());
+            }
             if let Some(file) = path.strip_prefix("/f/").or_else(|| path.strip_prefix("/d/")) {
                 if file.is_empty() || file.contains(['/', '\\']) || file.starts_with('.') {
                     return Err("that link has no file name in it".into());
@@ -647,6 +660,11 @@ impl Target {
             }
         };
         let code = code.to_ascii_uppercase();
+        if code.len() == public::ID_LEN && code.bytes().all(|b| b.is_ascii_alphanumeric()) {
+            return Err(format!(
+                "{code} looks like a public post, not a share code (those are 5 characters): open it with ml view {code}"
+            ));
+        }
         if code.len() != 5 || !code.bytes().all(|b| b.is_ascii_alphanumeric()) {
             return Err(format!("{code:?} is not a share code (codes are 5 letters and digits)"));
         }
@@ -703,18 +721,8 @@ fn get(server: &str, target: &Target, output: Option<PathBuf>, force: bool) -> R
         let name = safe_name(share.name.as_deref());
         save(&mut res.body_mut().as_reader(), output, force, &name, Some(share.size))?;
     }
-    if io::stderr().is_terminal() {
-        if share.burn {
-            eprintln!("Burned after reading: it's gone from the server now");
-        }
-        if share.public {
-            eprintln!(
-                "Public · {} · {} · ml comments {}",
-                plural(share.likes, "like"),
-                plural(share.comments, "comment"),
-                share.code
-            );
-        }
+    if share.burn && io::stderr().is_terminal() {
+        eprintln!("Burned after reading: it's gone from the server now");
     }
     Ok(())
 }
@@ -959,6 +967,7 @@ mod tests {
             "browse",
             "comments",
             "like",
+            "view",
             "get",
             "clip",
             "sync",
@@ -999,6 +1008,9 @@ mod tests {
         assert!(Target::parse("https://m.example.com/f/", None).is_err());
         assert!(Target::parse("https://m.example.com/f/../x", None).is_err());
         assert!(Target::parse("https://m.example.com/", None).is_err());
+        // Public posts aren't shares.
+        assert!(Target::parse("https://m.example.com/p/K7QX2AB", None).is_err_and(|e| e.contains("ml view")));
+        assert!(Target::parse("K7QX2AB", None).is_err_and(|e| e.contains("ml view K7QX2AB")));
     }
 
     #[test]

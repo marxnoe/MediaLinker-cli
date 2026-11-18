@@ -1,22 +1,69 @@
-//! Public shares from the terminal, like the site's Public page: browse them, read and post
-//! comments, and like them. Posting a share is `ml public` in `main.rs`.
+//! Public posts from the terminal, like the site's Public page: browse and open them, read and
+//! post comments, and like them. Posting is `ml public` in `main.rs`.
+//!
+//! Public posts aren't shares: they have their own IDs (7 characters, or 5 for posts from before
+//! they were split off shares), their own page (`/p/ID`) and their own API under `/public/`.
 
-use std::fs;
+use std::{fs, io::IsTerminal, path::PathBuf};
 
 use base64::{Engine, engine::general_purpose::URL_SAFE_NO_PAD};
 use serde::Deserialize;
 use serde_json::json;
 
-use crate::{Result, agent, check, config_dir, human_size, net_err, now, plural};
+use crate::{Result, agent, check, config_dir, human_size, net_err, now, plural, print_text, safe_name, save};
 
+/// The length of a new post's ID. Posts from before the split keep their 5-character codes.
+pub const ID_LEN: usize = 7;
+const OLD_ID_LEN: usize = 5;
 const PER_PAGE: u32 = 20;
-/// How much of a text share's first line a list row shows.
+/// How much of a text post's first line a list row shows.
 const TITLE_CHARS: usize = 60;
+
+/// A public post a command was pointed at: its ID, and the server if it came as a link.
+pub struct PostRef {
+    pub server: Option<String>,
+    pub id: String,
+}
+
+impl PostRef {
+    /// Takes an ID, a post link (`/p/ID`), or a link a post had before the split
+    /// (`/receive?code=ID`, `/?code=ID`).
+    pub fn parse(input: &str) -> Result<Self> {
+        let input = input.trim();
+        let (server, id) = if input.starts_with("http://") || input.starts_with("https://") {
+            let rest = input.split('#').next().unwrap_or_default();
+            let scheme_end = rest.find("://").unwrap() + 3;
+            let host_end = rest[scheme_end..]
+                .find(['/', '?'])
+                .map_or(rest.len(), |i| scheme_end + i);
+            let (path, query) = rest[host_end..].split_once('?').unwrap_or((&rest[host_end..], ""));
+            if path.starts_with("/f/") || path.starts_with("/d/") {
+                return Err("that's a direct link, not a public post".into());
+            }
+            let id = path
+                .strip_prefix("/p/")
+                .or_else(|| path.strip_prefix("/public/"))
+                .map(|p| p.split('/').next().unwrap_or_default())
+                .or_else(|| query.split('&').find_map(|p| p.strip_prefix("code=")))
+                .ok_or("that link has no public post in it")?;
+            (Some(rest[..host_end].to_string()), id)
+        } else {
+            (None, input)
+        };
+        let id = id.to_ascii_uppercase();
+        if ![ID_LEN, OLD_ID_LEN].contains(&id.len()) || !id.bytes().all(|b| b.is_ascii_alphanumeric()) {
+            return Err(format!("{id:?} is not a public post ID"));
+        }
+        Ok(Self { server, id })
+    }
+}
 
 #[derive(Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct Item {
-    code: String,
+    /// Servers from before the split call it `code`.
+    id: Option<String>,
+    code: Option<String>,
     kind: String,
     snippet: Option<String>,
     name: Option<String>,
@@ -32,7 +79,7 @@ struct List {
     items: Vec<Item>,
 }
 
-/// Lists one page of public shares, most liked or newest first, optionally filtered by `search`.
+/// Lists one page of public posts, most liked or newest first, optionally filtered by `search`.
 pub fn browse(server: &str, search: &str, new: bool, page: u32) -> Result<()> {
     let page = page.max(1);
     let mut req = agent()
@@ -51,17 +98,17 @@ pub fn browse(server: &str, search: &str, new: bool, page: u32) -> Result<()> {
         eprintln!(
             "{}",
             if page > 1 {
-                "No more public shares"
+                "No more public posts"
             } else {
-                "No public shares found"
+                "No public posts found"
             }
         );
         return Ok(());
     }
     for i in &list.items {
         println!(
-            "{}  {:>9}  {:>12}  {:>8}  {}",
-            i.code,
+            "{:<7}  {:>9}  {:>12}  {:>8}  {}",
+            i.id.as_deref().or(i.code.as_deref()).unwrap_or_default(),
             plural(i.likes, "like"),
             plural(i.comments, "comment"),
             ago(i.created_at),
@@ -75,13 +122,13 @@ pub fn browse(server: &str, search: &str, new: bool, page: u32) -> Result<()> {
         String::new()
     };
     eprintln!(
-        "Page {page} of {pages}, {} · ml get CODE opens one{more}",
-        plural(list.total, "share")
+        "Page {page} of {pages}, {} · ml view ID opens one{more}",
+        plural(list.total, "post")
     );
     Ok(())
 }
 
-/// A file's name and size, or the first line of a text share.
+/// A file's name and size, or the first line of a text post.
 fn title(i: &Item) -> String {
     if i.kind == "file" {
         return format!("{} ({})", i.name.as_deref().unwrap_or("file"), human_size(i.size));
@@ -113,9 +160,68 @@ struct Thread {
     locked: bool,
 }
 
-/// Prints a public share's comments, or posts `text` as a new one.
-pub fn comments(server: &str, code: &str, text: &str, name: Option<String>) -> Result<()> {
-    let url = format!("{server}/public/{code}/comments");
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct Post {
+    id: String,
+    kind: String,
+    text: Option<String>,
+    name: Option<String>,
+    url: Option<String>,
+    size: u64,
+    likes: u64,
+    comments: u64,
+}
+
+/// Opens a public post: prints its text, or downloads its file, like `ml get` does for a share.
+pub fn view(server: &str, id: &str, output: Option<PathBuf>, force: bool) -> Result<()> {
+    let agent = agent();
+    let res = agent
+        .get(format!("{server}/public/{id}"))
+        .call()
+        .map_err(net_err(server))?;
+    if res.status() == 404
+        && res
+            .headers()
+            .get("content-type")
+            .is_none_or(|t| t != "application/json")
+    {
+        return Err(format!(
+            "{server} doesn't know public posts by ID yet: open it with ml 0.9 or older"
+        ));
+    }
+    let post: Post = check(res)?
+        .body_mut()
+        .read_json()
+        .map_err(|e| format!("unexpected answer from server: {e}"))?;
+    if post.kind == "text" {
+        print_text(post.text.unwrap_or_default(), output, force)?;
+    } else {
+        let url = post.url.ok_or("unexpected answer from server")?;
+        let mut res = check(
+            agent
+                .get(format!("{server}{url}?download=1"))
+                .call()
+                .map_err(net_err(server))?,
+        )?;
+        let name = safe_name(post.name.as_deref());
+        save(&mut res.body_mut().as_reader(), output, force, &name, Some(post.size))?;
+    }
+    if std::io::stderr().is_terminal() {
+        eprintln!(
+            "Public post {} · {} · {} · ml comments {}",
+            post.id,
+            plural(post.likes, "like"),
+            plural(post.comments, "comment"),
+            post.id
+        );
+    }
+    Ok(())
+}
+
+/// Prints a public post's comments, or posts `text` as a new one.
+pub fn comments(server: &str, id: &str, text: &str, name: Option<String>) -> Result<()> {
+    let url = format!("{server}/public/{id}/comments");
     if !text.trim().is_empty() {
         let res = agent()
             .post(&url)
@@ -125,7 +231,7 @@ pub fn comments(server: &str, code: &str, text: &str, name: Option<String>) -> R
             .body_mut()
             .read_json()
             .map_err(|e| format!("unexpected answer from server: {e}"))?;
-        eprintln!("Posted comment #{} on {code}", c.no);
+        eprintln!("Posted comment #{} on {id}", c.no);
         return Ok(());
     }
     let thread: Thread = check(agent().get(&url).call().map_err(net_err(server))?)?
@@ -141,9 +247,9 @@ pub fn comments(server: &str, code: &str, text: &str, name: Option<String>) -> R
         println!();
     }
     if thread.locked {
-        eprintln!("Comments are closed on this share");
+        eprintln!("Comments are closed on this post");
     } else if thread.comments.is_empty() {
-        eprintln!("No comments yet. ml comments {code} \"your text\" posts one");
+        eprintln!("No comments yet. ml comments {id} \"your text\" posts one");
     }
     Ok(())
 }
@@ -153,10 +259,10 @@ struct Liked {
     likes: u64,
 }
 
-/// Likes a public share, or takes the like back. Counted once per machine, the way the site
+/// Likes a public post, or takes the like back. Counted once per machine, the way the site
 /// counts once per browser: a random ID kept in the config directory stands in for its cookie.
-pub fn like(server: &str, code: &str, undo: bool) -> Result<()> {
-    let url = format!("{server}/public/{code}/like");
+pub fn like(server: &str, id: &str, undo: bool) -> Result<()> {
+    let url = format!("{server}/public/{id}/like");
     let cookie = format!("ml_liker={}", liker()?);
     let res = if undo {
         agent().delete(&url).header("Cookie", &cookie).call()
@@ -169,7 +275,7 @@ pub fn like(server: &str, code: &str, undo: bool) -> Result<()> {
         .read_json()
         .map_err(|e| format!("unexpected answer from server: {e}"))?;
     let done = if undo { "Took back your like on" } else { "Liked" };
-    eprintln!("{done} {code} ({})", plural(liked.likes, "like"));
+    eprintln!("{done} {id} ({})", plural(liked.likes, "like"));
     Ok(())
 }
 
@@ -208,7 +314,8 @@ mod tests {
 
     fn item(kind: &str, snippet: Option<&str>, name: Option<&str>) -> Item {
         Item {
-            code: "K7QX2".into(),
+            id: Some("K7QX2AB".into()),
+            code: None,
             kind: kind.into(),
             snippet: snippet.map(Into::into),
             name: name.map(Into::into),
@@ -226,6 +333,46 @@ mod tests {
         assert_eq!(title(&item("text", Some("first\nsecond"), None)), "first…");
         let long = "x".repeat(100);
         assert_eq!(title(&item("text", Some(&long), None)), format!("{}…", "x".repeat(60)));
+    }
+
+    #[test]
+    fn posts_take_ids_and_links() {
+        let p = PostRef::parse(" k7qx2ab ").unwrap();
+        assert_eq!((p.id.as_str(), p.server), ("K7QX2AB", None));
+        assert_eq!(PostRef::parse("K7QX2").unwrap().id, "K7QX2");
+        let p = PostRef::parse("https://m.example.com/p/K7QX2AB").unwrap();
+        assert_eq!(
+            (p.id.as_str(), p.server.as_deref()),
+            ("K7QX2AB", Some("https://m.example.com"))
+        );
+        assert_eq!(
+            PostRef::parse("http://localhost:3000/public/k7qx2ab/file").unwrap().id,
+            "K7QX2AB"
+        );
+        // Links from before the split.
+        assert_eq!(
+            PostRef::parse("https://m.example.com/receive?code=K7QX2").unwrap().id,
+            "K7QX2"
+        );
+        assert_eq!(PostRef::parse("https://m.example.com/?code=K7QX2").unwrap().id, "K7QX2");
+        assert!(PostRef::parse("https://m.example.com/f/AbC12.png").is_err());
+        assert!(PostRef::parse("https://m.example.com/").is_err());
+        assert!(PostRef::parse("K7QX").is_err());
+        assert!(PostRef::parse("../../x").is_err());
+    }
+
+    #[test]
+    fn lists_read_ids_from_old_servers_too() {
+        let old: List = serde_json::from_str(
+            r#"{"total":1,"items":[{"code":"K7QX2","kind":"text","snippet":"hi","size":2,"createdAt":0,"likes":0,"comments":0,"liked":false}]}"#,
+        )
+        .unwrap();
+        assert_eq!(old.items[0].code.as_deref(), Some("K7QX2"));
+        let new: List = serde_json::from_str(
+            r#"{"total":1,"items":[{"id":"K7QX2AB","code":"K7QX2AB","kind":"text","size":2,"createdAt":0,"likes":0,"comments":0,"liked":false}]}"#,
+        )
+        .unwrap();
+        assert_eq!(new.items[0].id.as_deref(), Some("K7QX2AB"));
     }
 
     #[test]
