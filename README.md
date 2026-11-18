@@ -2,7 +2,7 @@
 
 `ml` shares files and text through a [MediaLinker](https://github.com/marxnoe/MediaLinker)
 server. Every share gets a 5-character code that works until it expires. It does everything the
-site does: short codes, direct links, burn after reading, end-to-end encryption, public shares with
+site does: short codes, direct links, burn after reading, end-to-end encryption, public posts with
 likes and comments, and a shared clipboard.
 
 ## Install
@@ -69,10 +69,14 @@ Plain direct links (`--link`) take images, audio, video and text; with `-e` any 
 link opens a page that decrypts it. `--short` asks is.gd for a short link, only when you pass it,
 and never for encrypted shares, whose key is in the link.
 
-## Public shares
+## Public posts
 
 `ml public` posts a file or some text to the server's Public page, like *Post something* there.
-It reads files, text and stdin the same way as `ml send` and prints the code.
+It reads files, text and stdin the same way as `ml send` and prints the post's ID.
+
+Public posts are kept apart from shares: they have 7-character IDs (posts from before the split
+keep their 5-character codes), their own page at `/p/ID`, and open with `ml view` rather than
+`ml get`. `ml get` only opens shares and direct links.
 
 ```sh
 ml public meme.png           # post a file
@@ -85,13 +89,17 @@ Anyone can see, like and comment on a public post. It never expires and isn't en
 no `--ttl` or `--encrypt`; don't post anything private.
 
 ```sh
-ml browse                    # most liked public shares, 20 at a time (--page 2 for more)
+ml browse                    # most liked public posts, 20 at a time (--page 2 for more)
 ml browse --new cats         # newest first, only ones mentioning "cats"
-ml get K7QX2                 # open one
-ml comments K7QX2            # read its comments
-ml comments K7QX2 "nice"     # post one; --name NAME, or NAME#secret for a tripcode
-ml like K7QX2                # like it (--undo takes it back)
+ml view K7QX2AB              # open one: prints text, or saves the file (-o, --force as for get)
+ml comments K7QX2AB          # read its comments
+ml comments K7QX2AB "nice"   # post one; --name NAME, or NAME#secret for a tripcode
+ml like K7QX2AB              # like it (--undo takes it back)
 ```
+
+`view`, `comments` and `like` take an ID or a post's link, including the links posts had before the
+split (`/receive?code=…`). This version needs a server that has public posts split off shares;
+older servers take public posts from `ml` 0.9 and older.
 
 Likes count once per machine, the way the site counts once per browser: `ml` keeps a random ID
 in its config directory. Nothing else identifies you.
